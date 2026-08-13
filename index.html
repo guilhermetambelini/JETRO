@@ -40,11 +40,20 @@
   .hero-value.pos{ color:var(--text); }
   .hero-sub{ font-size:12px; color:var(--text-faint); font-family:var(--font-mono); }
 
-  .nav-backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:40; }
-  .nav-panel{ position:fixed; top:0; left:0; bottom:0; width:250px; max-width:80vw; background:var(--panel); border-right:1px solid var(--border); z-index:41; padding:16px 10px; overflow-y:auto; }
+  .nav-backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:40; opacity:0; pointer-events:none; transition:opacity .18s ease; }
+  .nav-backdrop.open{ opacity:1; pointer-events:auto; }
+  .nav-panel{ position:fixed; top:0; left:0; bottom:0; width:230px; background:var(--panel); border-right:1px solid var(--border); z-index:41; padding:16px 10px; overflow-y:auto; transform:translateX(-100%); transition:transform .18s ease; }
+  .nav-panel.open{ transform:translateX(0); }
   .nav-panel-title{ font-family:var(--font-display); font-weight:700; font-size:16px; padding:8px 10px 16px; letter-spacing:.04em; }
   .nav-item{ display:block; width:100%; text-align:left; background:none; border:none; color:var(--text-dim); font-family:var(--font-display); font-weight:600; font-size:14px; padding:12px 10px; border-radius:8px; margin-bottom:2px; }
   .nav-item.active{ color:var(--accent); background:var(--panel-2); }
+  .date-field{ grid-column:1/-1; }
+  @media (min-width:900px){
+    .hamburger-btn{ display:none; }
+    .nav-panel{ transform:translateX(0) !important; }
+    .nav-backdrop{ display:none; }
+    #app{ margin-left:230px; }
+  }
 
   .section-title{ font-family:var(--font-display); font-weight:600; font-size:16px; margin:24px 0 10px; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
   .section-title:first-child{ margin-top:0; }
@@ -166,12 +175,15 @@
     reportFilter: { mode:'month', month: currentMonthKey(), from:'', to:'', categoria:'', conta:'', cartao:'' },
     vencimentosSort: 'status',
     vencimentosMonth: 'todos',
+    txMonth: currentMonthKey(),
     expandedCards: {},
     editing: { type:null, id:null, transferId:null },
     txDraft: null,
     billDraft: null,
     payingCycle: null,
     launchingBillId: null,
+    openBillMenu: null,
+    categoriesOpen: false,
     confirmingDeleteKey: null,
     saveStatus: ''
   };
@@ -221,7 +233,9 @@
     var dm=cycle.month, dy=cycle.year;
     if((card.dueDay||1) < (card.closingDay||1)){ dm++; if(dm>12){dm=1;dy++;} }
     var day = Math.min(card.dueDay||1, daysInMonth(dy,dm));
-    return new Date(dy, dm-1, day);
+    var d = new Date(dy, dm-1, day);
+    while(d.getDay()===0 || d.getDay()===6){ d.setDate(d.getDate()+1); }
+    return d;
   }
   function cycleOpenDate(card, cycle){
     var prev = addMonthsToCycle(cycle,-1);
@@ -281,10 +295,23 @@
     return { label: paidFraction>0 ? 'Parcial - a vencer' : 'A vencer', cls:'upcoming', order:2 };
   }
 
+  function billTransactionMonths(bill){
+    var set = {};
+    state.transactions.forEach(function(t){ if(t.billId===bill.id) set[t.date.slice(0,7)] = true; });
+    return Object.keys(set);
+  }
+  function billPaidMonthsCombined(bill){
+    var set = {};
+    billTransactionMonths(bill).forEach(function(mk){ set[mk]=true; });
+    (bill.manuallyPaidMonths||[]).forEach(function(mk){ set[mk]=true; });
+    return Object.keys(set);
+  }
+  function billIsPaidInMonth(bill, mk){ return billPaidMonthsCombined(bill).indexOf(mk) !== -1; }
+
   function activeFixedBills(){
     return state.fixedBills.filter(function(b){
       if(b.tipoRecorrencia === 'parcelada'){
-        return (b.launchedMonths||[]).length < (b.totalParcelas||1);
+        return billPaidMonthsCombined(b).length < (b.totalParcelas||1);
       }
       return true;
     });
@@ -303,8 +330,8 @@
       var key = 'bill:'+b.id;
       if(map[key]) return;
       var due = fixedBillDueDate(b);
-      var launched = (b.launchedMonths||[]).indexOf(mk) !== -1;
-      var st = computeStatus(due, launched ? 1 : 0);
+      var paid = billIsPaidInMonth(b, mk);
+      var st = computeStatus(due, paid ? 1 : 0);
       map[key] = { title:b.name, sub:(b.natureza==='receita'?'Receita fixa':'Despesa fixa')+' - vence dia '+b.dueDay, value:b.value, status:st, dueDate:due, kind:'bill', id:b.id };
     });
     state.cards.forEach(function(c){
@@ -493,9 +520,9 @@
   function optionsHTML(list, selected){ return list.map(function(v){ return '<option value="'+esc(v)+'" '+(v===selected?'selected':'')+'>'+esc(v)+'</option>'; }).join(''); }
 
   function sidebarHTML(){
-    if(!state.navOpen) return '';
-    return '<div class="nav-backdrop" data-action="close-nav"></div>'
-      + '<div class="nav-panel">'
+    var openCls = state.navOpen ? ' open' : '';
+    return '<div class="nav-backdrop'+openCls+'" data-action="close-nav"></div>'
+      + '<div class="nav-panel'+openCls+'">'
       + '<div class="nav-panel-title">JETRO</div>'
       + NAV_TABS.map(function(t){ return '<button type="button" class="nav-item '+(state.tab===t[0]?'active':'')+'" data-action="go-tab" data-tab="'+t[0]+'">'+t[1]+'</button>'; }).join('')
       + '</div>';
@@ -507,6 +534,14 @@
   }
 
   function headerHTML(){
+    return '<div class="app-header">'
+      + '<div class="app-title-row"><button type="button" class="hamburger-btn" data-action="toggle-nav">&#9776;</button>'
+      + '<p class="app-title">JETRO <span class="header-actions">'+ownerFilterHTML()+'<span class="save-status" id="save-status">'+esc(state.saveStatus)+'</span>'
+      + '<button type="button" class="icon-btn" data-action="refresh-now">Atualizar agora</button></span></p></div>'
+      + '</div>';
+  }
+
+  function heroSaldoHTML(){
     var totalSaldo=0, totalInvest=0;
     state.accounts.forEach(function(a){
       if(!passesOwnerFilter(a.titular)) return;
@@ -514,19 +549,15 @@
       if(a.isInvestment) totalInvest += bal; else totalSaldo += bal;
     });
     var extra = totalInvest !== 0 ? ' <span style="font-size:12px;color:var(--text-dim);font-weight:400;">(+ '+fmtBRL(totalInvest)+' em investimentos)</span>' : '';
-    return '<div class="app-header">'
-      + '<div class="app-title-row"><button type="button" class="hamburger-btn" data-action="toggle-nav">&#9776;</button>'
-      + '<p class="app-title">JETRO <span class="header-actions"><span class="save-status" id="save-status">'+esc(state.saveStatus)+'</span>'
-      + '<button type="button" class="icon-btn" data-action="refresh-now">Atualizar agora</button></span></p></div>'
-      + '<div class="hero"><div><div class="hero-label">Saldo total em contas'+(state.filterTitular?' - '+esc(state.filterTitular):'')+'</div>'
+    return '<div class="hero" style="margin-bottom:20px;"><div><div class="hero-label">Saldo total em contas'+(state.filterTitular?' - '+esc(state.filterTitular):'')+'</div>'
       + '<div class="hero-value '+(totalSaldo<0?'neg':'pos')+'">'+fmtBRL(totalSaldo)+extra+'</div></div>'
-      + '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">'+ownerFilterHTML()+'<div class="hero-sub">'+state.accounts.length+' conta(s) - '+state.cards.length+' cartão(ões)</div></div>'
-      + '</div></div>';
+      + '<div class="hero-sub">'+state.accounts.length+' conta(s) - '+state.cards.length+' cartão(ões)</div>'
+      + '</div>';
   }
 
   // ---------- overview ----------
   function renderOverview(){
-    var html = '';
+    var html = heroSaldoHTML();
     html += '<div class="section-title">Contas</div>';
     var accs = state.accounts.filter(function(a){ return passesOwnerFilter(a.titular); });
     if(accs.length === 0){
@@ -624,7 +655,7 @@
       + '<div><label>Valor (R$)</label><input type="number" step="0.01" min="0.01" name="value" required value="'+esc(d.value)+'"></div>'
       + '</div>'
       + '<div class="form-row">'
-      + '<div><label>Data</label><input type="date" name="date" required value="'+esc(d.date)+'"></div>'
+      + '<div class="date-field"><label>Data</label><input type="date" name="date" required value="'+esc(d.date)+'"></div>'
       + '<div><label>Descrição</label><input list="desc-list" type="text" name="desc" placeholder="Ex: Spotify" required autocomplete="off" value="'+esc(d.desc)+'">'
       +   '<datalist id="desc-list">'+ Array.from(new Set(state.transactions.map(function(t){return t.desc;}))).map(function(x){return '<option value="'+esc(x)+'">';}).join('') +'</datalist>'
       +   (descHint ? '<div class="autocomplete-hint">Igual a um lançamento anterior - categoria preenchida automaticamente. Ajuste se precisar.</div>' : '')
@@ -656,6 +687,10 @@
     var f = state.reportFilter;
     html += '<div class="section-title">Histórico</div>';
     html += '<div class="form-row" style="margin-bottom:10px;">'
+      + '<div><label>Mês</label><div class="month-picker"><button type="button" data-action="tx-month-prev">&lt;</button><span class="label">'+(state.txMonth==='todos'?'Todos os meses':monthLabel(state.txMonth))+'</span><button type="button" data-action="tx-month-next">&gt;</button></div></div>'
+      + '<div><label>&nbsp;</label><button type="button" class="btn btn-ghost btn-small" data-action="tx-month-all">Ver todos os meses</button></div>'
+      + '</div>';
+    html += '<div class="form-row" style="margin-bottom:10px;">'
       + '<div><label>Filtrar categoria</label><select data-action="tx-filter-categoria"><option value="">Todas</option>'+optionsHTML(state.categories, f.categoria)+'</select></div>'
       + '<div><label>Filtrar conta</label><select data-action="tx-filter-conta"><option value="">Todas</option>'+ state.accounts.map(function(a){return '<option value="'+a.id+'" '+(f.conta===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('') +'</select></div>'
       + '<div><label>Filtrar cartão</label><select data-action="tx-filter-cartao"><option value="">Todos</option>'+ state.cards.map(function(c){return '<option value="'+c.id+'" '+(f.cartao===c.id?'selected':'')+'>'+esc(c.name)+'</option>';}).join('') +'</select></div>'
@@ -663,6 +698,7 @@
 
     var seenTransfer = {};
     var all = state.transactions.filter(matchesReportFilters).filter(function(t){
+      if(state.txMonth !== 'todos' && t.date.slice(0,7) !== state.txMonth) return false;
       if(t.isTransfer){ if(seenTransfer[t.transferId]) return false; seenTransfer[t.transferId] = true; }
       return true;
     });
@@ -859,25 +895,28 @@
     var isEditing = state.editing.type === 'bill';
     var tipoSel = d.tipoRecorrencia;
     var formaSel = d.forma;
+    var isReceita = d.natureza === 'receita';
 
     var html = '<div class="section-title">'+(isEditing?'Editar conta fixa':'Nova conta fixa')+'</div>';
     html += '<form class="inline-form" data-form="bill">'
       + '<input type="hidden" name="id" value="'+(isEditing?state.editing.id:'')+'">'
       + '<div class="form-row">'
       + '<div><label>Nome</label><input type="text" name="name" placeholder="Ex: Aluguel, Financiamento do carro" required value="'+esc(d.name)+'"></div>'
+      + '<div><label>Natureza</label><select name="natureza" data-action="bill-natureza-change"><option value="despesa" '+(d.natureza==='despesa'?'selected':'')+'>Despesa</option><option value="receita" '+(d.natureza==='receita'?'selected':'')+'>Receita</option></select></div>'
       + '<div><label>Tipo</label><select name="tipoRecorrencia" data-action="bill-tipo-change"><option value="eterna" '+(tipoSel==='eterna'?'selected':'')+'>Recorrente (sem fim)</option><option value="parcelada" '+(tipoSel==='parcelada'?'selected':'')+'>Parcelada (tem fim)</option></select></div>'
-      + (tipoSel==='parcelada' ? '<div><label>Número de parcelas</label><input type="number" min="2" max="360" name="totalParcelas" value="'+esc(d.totalParcelas||'12')+'"></div>' : '<div><label>Natureza</label><select name="natureza"><option value="despesa" '+(d.natureza==='despesa'?'selected':'')+'>Despesa</option><option value="receita" '+(d.natureza==='receita'?'selected':'')+'>Receita</option></select></div>')
       + '</div>'
-      + (tipoSel==='parcelada' ? '<div class="form-row"><div><label>Natureza</label><select name="natureza"><option value="despesa" '+(d.natureza==='despesa'?'selected':'')+'>Despesa</option><option value="receita" '+(d.natureza==='receita'?'selected':'')+'>Receita</option></select></div><div></div><div></div></div>' : '')
+      + (tipoSel==='parcelada' ? '<div class="form-row"><div><label>Número de parcelas</label><input type="number" min="2" max="360" name="totalParcelas" value="'+esc(d.totalParcelas||'12')+'"></div><div></div><div></div></div>' : '')
       + '<div class="form-row">'
       + '<div><label>Valor padrão (R$)</label><input type="number" step="0.01" min="0.01" name="value" required value="'+esc(d.value)+'"></div>'
       + '<div><label>Dia do vencimento</label><input type="number" min="1" max="31" name="dueDay" required value="'+esc(d.dueDay)+'"></div>'
-      + '<div><label>Forma</label><select name="forma" data-action="bill-forma-change">'+FORMA_FIXA.map(function(f){return '<option value="'+f.v+'" '+(formaSel===f.v?'selected':'')+'>'+f.l+'</option>';}).join('')+'</select></div>'
+      + (isReceita ? '' : '<div><label>Forma</label><select name="forma" data-action="bill-forma-change">'+FORMA_FIXA.map(function(f){return '<option value="'+f.v+'" '+(formaSel===f.v?'selected':'')+'>'+f.l+'</option>';}).join('')+'</select></div>')
       + '</div>'
       + '<div class="form-row">'
-      + (formaSel==='cartao'
-          ? '<div><label>Cartão</label><select name="cardId">'+(state.cards.length?state.cards.map(function(c){return '<option value="'+c.id+'" '+(d.cardId===c.id?'selected':'')+'>'+esc(c.name)+'</option>';}).join(''):'<option value="">Cadastre um cartão primeiro</option>')+'</select></div>'
-          : '<div><label>Conta padrão</label><select name="accountId">'+ (state.accounts.length?('<option value="">Escolher na hora de lançar</option>'+state.accounts.map(function(a){return '<option value="'+a.id+'" '+(d.accountId===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('')):'<option value="">Cadastre uma conta primeiro</option>')+'</select></div>')
+      + (isReceita
+          ? '<div><label>Conta de destino</label><select name="accountId">'+ (state.accounts.length?('<option value="">Escolher na hora de lançar</option>'+state.accounts.map(function(a){return '<option value="'+a.id+'" '+(d.accountId===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('')):'<option value="">Cadastre uma conta primeiro</option>')+'</select></div>'
+          : (formaSel==='cartao'
+              ? '<div><label>Cartão</label><select name="cardId">'+(state.cards.length?state.cards.map(function(c){return '<option value="'+c.id+'" '+(d.cardId===c.id?'selected':'')+'>'+esc(c.name)+'</option>';}).join(''):'<option value="">Cadastre um cartão primeiro</option>')+'</select></div>'
+              : '<div><label>Conta padrão</label><select name="accountId">'+ (state.accounts.length?('<option value="">Escolher na hora de lançar</option>'+state.accounts.map(function(a){return '<option value="'+a.id+'" '+(d.accountId===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('')):'<option value="">Cadastre uma conta primeiro</option>')+'</select></div>'))
       + '</div>'
       + '<div class="form-actions">'+(isEditing?'<button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>':'')+'<button type="submit" class="btn btn-primary">'+(isEditing?'Salvar alterações':'Adicionar conta fixa')+'</button></div></form>';
 
@@ -888,33 +927,46 @@
     }else{
       var mk = currentMonthKey();
       var sorted = active.slice().sort(function(a,b){
-        var sa = computeStatus(fixedBillDueDate(a), (a.launchedMonths||[]).indexOf(mk)!==-1?1:0);
-        var sb = computeStatus(fixedBillDueDate(b), (b.launchedMonths||[]).indexOf(mk)!==-1?1:0);
+        var sa = computeStatus(fixedBillDueDate(a), billIsPaidInMonth(a,mk)?1:0);
+        var sb = computeStatus(fixedBillDueDate(b), billIsPaidInMonth(b,mk)?1:0);
         if(sa.order!==sb.order) return sa.order-sb.order;
         return a.dueDay-b.dueDay;
       });
       html += '<div class="list">' + sorted.map(function(b){
-        var launched = (b.launchedMonths||[]).indexOf(mk) !== -1;
-        var st = computeStatus(fixedBillDueDate(b), launched?1:0);
+        var paidThisMonth = billIsPaidInMonth(b, mk);
+        var viaTransaction = billTransactionMonths(b).indexOf(mk) !== -1;
+        var viaManual = (b.manuallyPaidMonths||[]).indexOf(mk) !== -1;
+        var st = computeStatus(fixedBillDueDate(b), paidThisMonth?1:0);
         var delKey = 'bill:'+b.id;
         var confirming = state.confirmingDeleteKey === delKey;
-        var parcelaInfo = b.tipoRecorrencia==='parcelada' ? ' <span class="tag">'+((b.launchedMonths||[]).length)+'/'+b.totalParcelas+'</span>' : '';
+        var parcelaInfo = b.tipoRecorrencia==='parcelada' ? ' <span class="tag">'+billPaidMonthsCombined(b).length+'/'+b.totalParcelas+'</span>' : '';
         var formaLabel = FORMA_FIXA.filter(function(f){return f.v===b.forma;})[0];
         var isLaunching = state.launchingBillId === b.id;
+        var menuOpen = state.openBillMenu === b.id;
 
         var row = '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(b.name)+parcelaInfo+(b.natureza==='receita'?' <span class="tag">receita</span>':'')+'</div>'
-          + '<div class="li-sub">Vence dia '+b.dueDay+' - '+(formaLabel?formaLabel.l:'')+'</div></div>'
+          + '<div class="li-sub">Vence dia '+b.dueDay+(b.natureza==='receita'?'':' - '+(formaLabel?formaLabel.l:''))+'</div></div>'
           + '<span class="badge '+st.cls+'">'+st.label+'</span><div class="li-value '+(b.natureza==='receita'?'entrada':'saida')+'">'+fmtBRL(b.value)+'</div>'
           + '<div class="li-actions">'
-          + (launched ? '' : '<button type="button" class="btn btn-primary btn-small" data-action="start-launch" data-id="'+b.id+'">Lançar</button>')
-          + '<button type="button" class="icon-btn" data-action="edit-bill" data-id="'+b.id+'">Editar</button>'
-          + '<button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-bill" data-id="'+b.id+'">'+(confirming?'Confirmar':'Excluir')+'</button></div></div>';
+          + (paidThisMonth ? '' : '<button type="button" class="btn btn-primary btn-small" data-action="start-launch" data-id="'+b.id+'">Lançar</button>')
+          + '<button type="button" class="icon-btn" data-action="toggle-bill-menu" data-id="'+b.id+'">&#8942;</button>'
+          + '</div></div>';
+
+        if(menuOpen){
+          row += '<div class="li-actions" style="justify-content:flex-end;margin-top:-4px;">'
+            + '<button type="button" class="icon-btn" data-action="edit-bill" data-id="'+b.id+'">Editar</button>'
+            + (viaTransaction ? '' : (viaManual
+                ? '<button type="button" class="icon-btn" data-action="toggle-manual-paid" data-id="'+b.id+'">Desmarcar como pago</button>'
+                : '<button type="button" class="icon-btn" data-action="toggle-manual-paid" data-id="'+b.id+'">Marcar como pago (sem descontar)</button>'))
+            + '<button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-bill" data-id="'+b.id+'">'+(confirming?'Confirmar':'Excluir')+'</button>'
+            + '</div>';
+        }
 
         if(isLaunching){
           var accOptsL = state.accounts.map(function(a){return '<option value="'+a.id+'" '+(b.accountId===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('');
           row += '<form class="inline-form" data-form="launch-bill" data-bill-id="'+b.id+'" style="margin-top:-2px;">'
             + '<div class="form-row">'
-            + '<div><label>Data</label><input type="date" name="date" value="'+todayISO()+'" required></div>'
+            + '<div class="date-field"><label>Data</label><input type="date" name="date" value="'+todayISO()+'" required></div>'
             + '<div><label>Valor real (R$)</label><input type="number" step="0.01" min="0.01" name="value" value="'+b.value+'" required></div>'
             + (b.forma==='cartao' ? '' : '<div><label>Conta</label><select name="accountId" required>'+(state.accounts.length?accOptsL:'<option value="">Cadastre uma conta primeiro</option>')+'</select></div>')
             + '</div>'
@@ -954,7 +1006,7 @@
     if(f.mode==='month'){
       html += '<div><label>&nbsp;</label><div class="month-picker"><button type="button" data-action="report-prev">&lt;</button><span class="label">'+monthLabel(f.month)+'</span><button type="button" data-action="report-next">&gt;</button></div></div>';
     }else if(f.mode==='custom'){
-      html += '<div><label>De</label><input type="date" data-action="report-from-change" value="'+esc(f.from)+'"></div><div><label>Até</label><input type="date" data-action="report-to-change" value="'+esc(f.to)+'"></div>';
+      html += '<div class="date-field"><label>De</label><input type="date" data-action="report-from-change" value="'+esc(f.from)+'"></div><div class="date-field"><label>Até</label><input type="date" data-action="report-to-change" value="'+esc(f.to)+'"></div>';
     }
     html += '</div>';
 
@@ -1031,14 +1083,16 @@
 
   // ---------- settings ----------
   function renderSettings(){
-    var html = '<div class="section-title">Categorias</div>';
-    html += '<form class="inline-form" data-form="add-category"><div class="form-row"><div><label>Nova categoria</label><input type="text" name="name" placeholder="Ex: Pet shop" required></div></div><div class="form-actions"><button type="submit" class="btn btn-primary btn-small">Adicionar categoria</button></div></form>';
-    html += '<div class="list">' + state.categories.map(function(cat){
-      var delKey = 'category:'+cat;
-      var confirming = state.confirmingDeleteKey === delKey;
-      return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(cat)+'</div></div>'
-        + '<div class="li-actions"><button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-category" data-id="'+esc(cat)+'">'+(confirming?'Confirmar':'Excluir')+'</button></div></div>';
-    }).join('') + '</div>';
+    var html = '<div class="section-title">Categorias<button type="button" class="icon-btn" data-action="toggle-categories-open">'+(state.categoriesOpen?'Recolher':'('+state.categories.length+') Ver / editar')+'</button></div>';
+    if(state.categoriesOpen){
+      html += '<form class="inline-form" data-form="add-category"><div class="form-row"><div><label>Nova categoria</label><input type="text" name="name" placeholder="Ex: Pet shop" required></div></div><div class="form-actions"><button type="submit" class="btn btn-primary btn-small">Adicionar categoria</button></div></form>';
+      html += '<div class="list">' + state.categories.map(function(cat){
+        var delKey = 'category:'+cat;
+        var confirming = state.confirmingDeleteKey === delKey;
+        return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(cat)+'</div></div>'
+          + '<div class="li-actions"><button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-category" data-id="'+esc(cat)+'">'+(confirming?'Confirmar':'Excluir')+'</button></div></div>';
+      }).join('') + '</div>';
+    }
 
     html += '<div class="section-title">Orçamento por categoria (mensal, editável a qualquer momento)</div>';
     html += '<form class="inline-form" data-form="set-budget"><div class="form-row">'
@@ -1110,14 +1164,28 @@
     var action = btn.dataset.action;
     var isDeleteAction = action.indexOf('delete-') === 0 || action === 'reset-all';
 
+    if(action==='toggle-categories-open'){ state.categoriesOpen = !state.categoriesOpen; render(); return; }
     if(action==='toggle-nav'){ state.navOpen = !state.navOpen; render(); return; }
     if(action==='close-nav'){ state.navOpen = false; render(); return; }
     if(action==='go-tab'){
       state.tab=btn.dataset.tab; state.navOpen=false; state.editing={type:null,id:null,transferId:null};
       state.confirmingDeleteKey=null; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft();
-      state.payingCycle=null; state.launchingBillId=null; render(); return;
+      state.payingCycle=null; state.launchingBillId=null; state.openBillMenu=null; render(); return;
     }
-    if(action==='cancel-edit'){ state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft(); render(); return; }
+    if(action==='cancel-edit'){ state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft(); state.openBillMenu=null; render(); return; }
+    if(action==='toggle-bill-menu'){ state.openBillMenu = (state.openBillMenu===btn.dataset.id) ? null : btn.dataset.id; render(); return; }
+    if(action==='toggle-manual-paid'){
+      var billId2 = btn.dataset.id;
+      var bill2 = state.fixedBills.filter(function(x){return x.id===billId2;})[0];
+      var mk2 = currentMonthKey();
+      update(function(){
+        bill2.manuallyPaidMonths = bill2.manuallyPaidMonths || [];
+        var idx = bill2.manuallyPaidMonths.indexOf(mk2);
+        if(idx >= 0) bill2.manuallyPaidMonths.splice(idx,1); else bill2.manuallyPaidMonths.push(mk2);
+        state.openBillMenu = null;
+      });
+      return;
+    }
     if(action==='toggle-card-expand'){ var cid=btn.dataset.id; state.expandedCards[cid]=!state.expandedCards[cid]; render(); return; }
     if(action.indexOf('edit-')===0 && action!=='edit'){
       var type = action.replace('edit-','');
@@ -1141,6 +1209,9 @@
     if(action==='start-launch'){ state.launchingBillId = btn.dataset.id; render(); return; }
     if(action==='cancel-launch'){ state.launchingBillId = null; render(); return; }
     if(action==='refresh-now'){ loadState(); return; }
+    if(action==='tx-month-prev'){ state.txMonth = state.txMonth==='todos' ? shiftMonth(currentMonthKey(),-1) : shiftMonth(state.txMonth,-1); render(); return; }
+    if(action==='tx-month-next'){ state.txMonth = state.txMonth==='todos' ? shiftMonth(currentMonthKey(),1) : shiftMonth(state.txMonth,1); render(); return; }
+    if(action==='tx-month-all'){ state.txMonth = 'todos'; render(); return; }
     if(action==='report-prev'){ state.reportFilter.month = shiftMonth(state.reportFilter.month,-1); render(); return; }
     if(action==='report-next'){ state.reportFilter.month = shiftMonth(state.reportFilter.month, 1); render(); return; }
     if(action==='export-image'){ exportImage(); return; }
@@ -1223,6 +1294,7 @@
     else if(t.dataset.action === 'card-select-change'){ refreshCycleOptions(t.closest('form')); }
     else if(t.dataset.action === 'owner-filter-change'){ state.filterTitular = t.value; render(); }
     else if(t.dataset.action === 'bill-tipo-change'){ render(); }
+    else if(t.dataset.action === 'bill-natureza-change'){ render(); }
     else if(t.dataset.action === 'bill-forma-change'){ render(); }
     else if(t.dataset.action === 'vencimentos-sort-change'){ state.vencimentosSort = t.value; persist(); render(); }
     else if(t.dataset.action === 'vencimentos-month-change'){ state.vencimentosMonth = t.value; persist(); render(); }
@@ -1277,7 +1349,7 @@
       var bDueDay = clampInt(fd.get('dueDay'),1,31);
       var tipoRecorrencia = fd.get('tipoRecorrencia');
       var totalParcelas = tipoRecorrencia==='parcelada' ? clampInt(fd.get('totalParcelas'),2,360) : null;
-      var forma = fd.get('forma');
+      var forma = natureza==='receita' ? 'debito_automatico' : fd.get('forma');
       var cardId = forma==='cartao' ? fd.get('cardId') : null;
       var accountId = forma!=='cartao' ? (fd.get('accountId')||null) : null;
       if(!bname || !bvalue) return;
@@ -1286,7 +1358,7 @@
           var b = state.fixedBills.filter(function(x){return x.id===id;})[0];
           b.name=bname; b.natureza=natureza; b.value=bvalue; b.dueDay=bDueDay; b.tipoRecorrencia=tipoRecorrencia; b.totalParcelas=totalParcelas; b.forma=forma; b.cardId=cardId; b.accountId=accountId;
         }else{
-          state.fixedBills.push({ id:uid(), name:bname, natureza:natureza, value:bvalue, dueDay:bDueDay, tipoRecorrencia:tipoRecorrencia, totalParcelas:totalParcelas, forma:forma, cardId:cardId, accountId:accountId, launchedMonths:[] });
+          state.fixedBills.push({ id:uid(), name:bname, natureza:natureza, value:bvalue, dueDay:bDueDay, tipoRecorrencia:tipoRecorrencia, totalParcelas:totalParcelas, forma:forma, cardId:cardId, accountId:accountId, manuallyPaidMonths:[] });
         }
         state.editing={type:null,id:null,transferId:null}; state.billDraft=freshBillDraft();
       });
@@ -1324,8 +1396,6 @@
           tx.accountId = laccountId || bill.accountId;
         }
         state.transactions.push(tx);
-        bill.launchedMonths = bill.launchedMonths || [];
-        if(bill.launchedMonths.indexOf(mk) === -1) bill.launchedMonths.push(mk);
         state.launchingBillId = null;
       });
     }
