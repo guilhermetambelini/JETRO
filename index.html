@@ -141,6 +141,7 @@
 
   var DEFAULT_CATEGORIES = ['Alimentação','Mercado','Transporte','Moradia','Lazer','Saúde','Educação','Assinaturas','Vestuário','Pets','Presentes','Outros'];
   var DEFAULT_INCOME_CATEGORIES = ['Salário','Prestação de serviço','Presentes','Renda extra','Outros'];
+  var DEFAULT_PRESENTE_CATEGORIES = ['Dízimo','Oferta','Presente','Doação','Caridade','Outros'];
   var FORMAS = ['Cartão de Crédito','Pix','Débito','Dinheiro'];
   var FORMAS_RECEITA = ['Pix','Dinheiro'];
   var PAGAMENTO_FATURA_FORMA = 'Pagamento de Fatura';
@@ -175,6 +176,7 @@
     fixedBills: [],
     categories: DEFAULT_CATEGORIES.slice(),
     incomeCategories: DEFAULT_INCOME_CATEGORIES.slice(),
+    presenteCategories: DEFAULT_PRESENTE_CATEGORIES.slice(),
     titularColors: Object.assign({}, DEFAULT_COLORS),
     budgets: {},
     reportFilter: { mode:'month', month: currentMonthKey(), from:'', to:'', categoria:'', conta:'', cartao:'' },
@@ -190,6 +192,7 @@
     openBillMenu: null,
     categoriesOpen: false,
     incomeCategoriesOpen: false,
+    presenteCategoriesOpen: false,
     confirmingDeleteKey: null,
     saveStatus: ''
   };
@@ -518,6 +521,7 @@
         });
         if(!state.categories || !state.categories.length) state.categories = DEFAULT_CATEGORIES.slice();
         if(!state.incomeCategories || !state.incomeCategories.length) state.incomeCategories = DEFAULT_INCOME_CATEGORIES.slice();
+        if(!state.presenteCategories || !state.presenteCategories.length) state.presenteCategories = DEFAULT_PRESENTE_CATEGORIES.slice();
         if(!state.titularColors) state.titularColors = Object.assign({}, DEFAULT_COLORS);
         if(!state.budgets) state.budgets = {};
         if(!state.reportFilter.categoria) state.reportFilter.categoria = '';
@@ -539,7 +543,7 @@
       if(!isConfigured()) return;
       var toSave = {
         tab: state.tab, filterTitular: state.filterTitular, accounts: state.accounts, cards: state.cards,
-        transactions: state.transactions, fixedBills: state.fixedBills, categories: state.categories, incomeCategories: state.incomeCategories,
+        transactions: state.transactions, fixedBills: state.fixedBills, categories: state.categories, incomeCategories: state.incomeCategories, presenteCategories: state.presenteCategories,
         titularColors: state.titularColors, budgets: state.budgets, reportFilter: state.reportFilter,
         vencimentosSort: state.vencimentosSort, vencimentosMonth: state.vencimentosMonth
       };
@@ -679,7 +683,8 @@
     var formaList = isReceita ? FORMAS_RECEITA : FORMAS;
     if(!isTransfer && formaList.indexOf(d.forma) === -1) d.forma = formaList[0];
     var isCard = !isTransfer && d.forma === 'Cartão de Crédito';
-    var categoryList = isReceita ? state.incomeCategories : state.categories;
+    var isPresente = d.tipo === 'presente';
+    var categoryList = isReceita ? state.incomeCategories : (isPresente ? state.presenteCategories : state.categories);
     var isEditing = state.editing.type === 'transaction';
     var editingT = isEditing ? state.transactions.filter(function(t){return t.id===state.editing.id;})[0] : null;
     var descHint = !isEditing ? findAutocompleteMatch(d.desc) : null;
@@ -694,7 +699,7 @@
       + '</div>'
       + '<div class="form-row date-row"><div class="date-field"><label>Data</label><input type="date" name="date" required value="'+esc(d.date)+'"></div></div>'
       + '<div class="form-row">'
-      + '<div><label>Descrição</label><input list="desc-list" type="text" name="desc" placeholder="Ex: Spotify" required autocomplete="off" value="'+esc(d.desc)+'">'
+      + '<div><label>Descrição'+(isTransfer?' (opcional)':'')+'</label><input list="desc-list" type="text" name="desc" placeholder="Ex: Spotify" '+(isTransfer?'':'required')+' autocomplete="off" value="'+esc(d.desc)+'">'
       +   '<datalist id="desc-list">'+ Array.from(new Set(state.transactions.map(function(t){return t.desc;}))).map(function(x){return '<option value="'+esc(x)+'">';}).join('') +'</datalist>'
       +   (descHint ? '<div class="autocomplete-hint">Igual a um lançamento anterior - categoria preenchida automaticamente. Ajuste se precisar.</div>' : '')
       + '</div>'
@@ -1143,6 +1148,17 @@
       }).join('') + '</div>';
     }
 
+    html += '<div class="section-title">Categorias de presente / doação<button type="button" class="icon-btn" data-action="toggle-presente-categories-open">'+(state.presenteCategoriesOpen?'Recolher':'('+state.presenteCategories.length+') Ver / editar')+'</button></div>';
+    if(state.presenteCategoriesOpen){
+      html += '<form class="inline-form" data-form="add-presente-category"><div class="form-row"><div><label>Nova categoria de presente/doação</label><input type="text" name="name" placeholder="Ex: Ajuda a amigo" required></div></div><div class="form-actions"><button type="submit" class="btn btn-primary btn-small">Adicionar categoria</button></div></form>';
+      html += '<div class="list">' + state.presenteCategories.map(function(cat){
+        var delKey = 'presente-category:'+cat;
+        var confirming = state.confirmingDeleteKey === delKey;
+        return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(cat)+'</div></div>'
+          + '<div class="li-actions"><button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-presente-category" data-id="'+esc(cat)+'">'+(confirming?'Confirmar':'Excluir')+'</button></div></div>';
+      }).join('') + '</div>';
+    }
+
     html += '<div class="section-title">Orçamento por categoria (mensal, editável a qualquer momento)</div>';
     html += '<form class="inline-form" data-form="set-budget"><div class="form-row">'
       + '<div><label>Categoria</label><select name="category">'+optionsHTML(state.categories, '')+'</select></div>'
@@ -1215,6 +1231,7 @@
 
     if(action==='toggle-categories-open'){ state.categoriesOpen = !state.categoriesOpen; render(); return; }
     if(action==='toggle-income-categories-open'){ state.incomeCategoriesOpen = !state.incomeCategoriesOpen; render(); return; }
+    if(action==='toggle-presente-categories-open'){ state.presenteCategoriesOpen = !state.presenteCategoriesOpen; render(); return; }
     if(action==='toggle-nav'){ state.navOpen = !state.navOpen; render(); return; }
     if(action==='close-nav'){ state.navOpen = false; render(); return; }
     if(action==='go-tab'){
@@ -1296,6 +1313,8 @@
           update(function(){ state.categories = state.categories.filter(function(c){return c!==btn.dataset.id;}); delete state.budgets[btn.dataset.id]; state.confirmingDeleteKey=null; });
         }else if(action==='delete-income-category'){
           update(function(){ state.incomeCategories = state.incomeCategories.filter(function(c){return c!==btn.dataset.id;}); state.confirmingDeleteKey=null; });
+        }else if(action==='delete-presente-category'){
+          update(function(){ state.presenteCategories = state.presenteCategories.filter(function(c){return c!==btn.dataset.id;}); state.confirmingDeleteKey=null; });
         }else if(action==='delete-transaction'){
           var delId = btn.dataset.id;
           update(function(){
@@ -1467,6 +1486,13 @@
       form.reset();
     }
 
+    if(type === 'add-presente-category'){
+      var presCatName = (fd.get('name')||'').trim();
+      if(!presCatName) return;
+      update(function(){ if(state.presenteCategories.indexOf(presCatName)===-1) state.presenteCategories.push(presCatName); });
+      form.reset();
+    }
+
     if(type === 'set-budget'){
       var bcat = fd.get('category');
       var bval = parseFloat(fd.get('value')) || 0;
@@ -1485,10 +1511,12 @@
       var forma = isTransfer ? null : fd.get('forma');
       var isCard = !isTransfer && forma === 'Cartão de Crédito';
       var isReceita = tipo === 'entrada';
+      var isPresente = tipo === 'presente';
 
       if(isTransfer){
         var origemId = fd.get('origemId'), destinoId = fd.get('destinoId');
-        if(!value || !desc || !origemId || !destinoId || origemId===destinoId) return;
+        if(!desc) desc = 'Transferência entre contas';
+        if(!value || !origemId || !destinoId || origemId===destinoId) return;
         var transferCategory = 'Transferência interna';
         update(function(){
           if(id && state.editing.transferId){
@@ -1514,7 +1542,7 @@
       if(!value || !desc || !category) return;
       if(isCard && !cardId) return;
       if(!isCard && !accountId) return;
-      var targetCategoryList = isReceita ? state.incomeCategories : state.categories;
+      var targetCategoryList = isReceita ? state.incomeCategories : (isPresente ? state.presenteCategories : state.categories);
       if(category && targetCategoryList.indexOf(category)===-1) targetCategoryList.push(category);
 
       update(function(){
