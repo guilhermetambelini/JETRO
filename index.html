@@ -101,6 +101,8 @@
   .badge.soon{ background:var(--amber-dim); color:var(--amber); }
   .badge.upcoming{ background:var(--panel-2); color:var(--text-dim); border:1px solid var(--border); }
   .badge.paid{ background:var(--green-dim); color:var(--green); }
+  .badge.receive{ background:transparent; color:var(--green); border:1px solid var(--green-dim); }
+  .owner-tag{ font-size:10px; font-weight:600; padding:2px 7px; border-radius:999px; margin-left:6px; border:1px solid; white-space:nowrap; }
   .tag{ font-size:10px; padding:2px 7px; border-radius:999px; background:var(--panel-2); color:var(--text-dim); border:1px solid var(--border); margin-left:6px; }
   .report-row{ display:grid; gap:6px; margin-bottom:12px; }
   .report-head{ display:flex; justify-content:space-between; font-size:13px; }
@@ -186,7 +188,7 @@
     txFilter: defaultTxFilter(),
     billsMonth: currentMonthKey(),
     vencimentosSort: 'status',
-    vencimentosMonth: 'todos',
+    vencimentosMonth: currentMonthKey(),
     txMonth: currentMonthKey(),
     expandedCards: {},
     editing: { type:null, id:null, transferId:null },
@@ -346,10 +348,16 @@
     return bal;
   }
 
-  function computeStatus(dueDateObj, paidFraction){
-    if(paidFraction >= 1) return { label:'Pago', cls:'paid', order:3 };
+  function computeStatus(dueDateObj, paidFraction, isReceita){
     var today = new Date(); today.setHours(0,0,0,0);
     var diffDays = Math.round((dueDateObj.getTime()-today.getTime())/86400000);
+    if(isReceita){
+      if(paidFraction >= 1) return { label:'Recebido', cls:'paid', order:3 };
+      if(diffDays < 0) return { label:'Não recebido', cls:'late', order:0 };
+      if(diffDays <= 3) return { label:'Recebe em breve', cls:'receive', order:1 };
+      return { label:'A receber', cls:'receive', order:2 };
+    }
+    if(paidFraction >= 1) return { label:'Pago', cls:'paid', order:3 };
     if(diffDays < 0) return { label: paidFraction>0 ? 'Parcial - atrasada' : 'Atrasada', cls:'late', order:0 };
     if(diffDays <= 3) return { label: paidFraction>0 ? 'Parcial - vence em breve' : 'Vence em breve', cls:'soon', order:1 };
     return { label: paidFraction>0 ? 'Parcial - a vencer' : 'A vencer', cls:'upcoming', order:2 };
@@ -399,37 +407,73 @@
     var day = Math.min(bill.dueDay||1, daysInMonth(p[0],p[1]));
     return new Date(p[0], p[1]-1, day);
   }
+  function billOwner(b){
+    if(b.forma==='cartao' && b.cardId){ var c = state.cards.filter(function(x){return x.id===b.cardId;})[0]; if(c) return c.titular||''; }
+    if(b.accountId){ var a = state.accounts.filter(function(x){return x.id===b.accountId;})[0]; if(a) return a.titular||''; }
+    return '';
+  }
+  function ownerTagHTML(titular){
+    if(!titular) return '';
+    var col = ownerColor(titular);
+    return '<span class="owner-tag" style="color:'+col+';border-color:'+col+'">'+esc(titular)+'</span>';
+  }
   function earliestBillMonth(b){ var m = billPaidMonthsCombined(b).sort(); return m[0] || ''; }
 
+  // monthMode: 'todos' ou 'AAAA-MM' (filtra pela data de vencimento)
   function getReminders(monthMode){
     var cur = currentMonthKey();
+    var target = (monthMode && monthMode !== 'todos') ? monthMode : null;
     var items = [];
-    [shiftMonth(cur,-1), cur, shiftMonth(cur,1)].forEach(function(mk){
+    var billMonths = target ? [target] : [shiftMonth(cur,-1), cur, shiftMonth(cur,1)];
+    billMonths.forEach(function(mk){
       billsForMonth(mk).forEach(function(b){
+        var owner = billOwner(b);
+        if(owner && !passesOwnerFilter(owner)) return;
+        var isRec = b.natureza === 'receita';
         var due = fixedBillDueDate(b, mk);
         var paid = billIsPaidInMonth(b, mk);
         var parc = billParcelaLabel(b, mk);
-        items.push({ title:b.name+(parc?' ('+parc+')':''), sub:(b.natureza==='receita'?'Receita fixa':'Despesa fixa')+' - vence em '+fmtDateObj(due), value:billValueInMonth(b, mk), status:computeStatus(due, paid?1:0), dueDate:due, kind:'bill', id:b.id, paid:paid });
+        items.push({ title:b.name+(parc?' ('+parc+')':''), sub:(isRec?'Receita fixa - recebe em ':'Despesa fixa - vence em ')+fmtDateObj(due), value:billValueInMonth(b, mk), status:computeStatus(due, paid?1:0, isRec), dueDate:due, kind:'bill', id:b.id, paid:paid, isReceita:isRec, owner:owner });
       });
     });
     state.cards.forEach(function(c){
+      if(!passesOwnerFilter(c.titular)) return;
       var openCk = openCycleKey(c), closedCk = closedCycleKey(c);
-      var set = {}; set[openCk] = true; set[closedCk] = true;
-      // faturas antigas que ainda tem saldo em aberto
-      state.transactions.forEach(function(t){ if(t.cardId===c.id && t.invoiceCycleKey && t.invoiceCycleKey < closedCk) set[t.invoiceCycleKey] = true; });
+      var set = {};
+      if(target){
+        // a fatura que vence no mes escolhido pode ser do ciclo do mes anterior, do proprio mes ou do seguinte
+        [shiftMonth(target,-1), target, shiftMonth(target,1)].forEach(function(k){ set[k] = true; });
+      }else{
+        set[openCk] = true; set[closedCk] = true;
+        // faturas antigas que ainda tem saldo em aberto
+        state.transactions.forEach(function(t){ if(t.cardId===c.id && t.invoiceCycleKey && t.invoiceCycleKey < closedCk) set[t.invoiceCycleKey] = true; });
+      }
       Object.keys(set).forEach(function(ck){
         var total = cardInvoiceTotal(c, ck);
         if(total <= 0) return;
-        var paid = cyclePaid(c, ck);
-        var restante = total - paid;
-        if(ck < closedCk && restante <= 0.009) return;
         var cyc = parseCycleKey(ck);
         var due = invoiceDueDate(c, cyc);
-        var isOpen = ck === openCk;
-        items.push({ title:c.name+' - Fatura'+(isOpen?' (em aberto)':''), sub:(isOpen?'Fecha em '+fmtDateObj(cardClosingDate(c, cyc.year, cyc.month))+' - ':'')+'Vence em '+fmtDateObj(due), value:Math.max(0,restante), status:computeStatus(due, paid/total), dueDate:due, kind:'invoice', id:c.id, paid: restante <= 0.009 });
+        var dueMk = due.getFullYear()+'-'+pad2(due.getMonth()+1);
+        if(target && dueMk !== target) return;
+        var paid = cyclePaid(c, ck);
+        var restante = total - paid;
+        if(!target && ck < closedCk && restante <= 0.009) return;
+        var fase = ck === openCk ? ' (em aberto)' : (ck > openCk ? ' (futura)' : ' (fechada)');
+        var fechaTxt = ck >= openCk ? 'Fecha em '+fmtDateObj(cardClosingDate(c, cyc.year, cyc.month))+' - ' : '';
+        items.push({ title:c.name+' - Fatura'+fase, sub:fechaTxt+'Vence em '+fmtDateObj(due)+(paid>0 && restante>0.009?' - já pago: '+fmtBRL(paid):''), value:restante>0.009?restante:total, status:computeStatus(due, paid/total), dueDate:due, kind:'invoice', id:c.id, paid: restante <= 0.009, owner:c.titular||'' });
       });
     });
-    return filterRemindersByMonth(items, monthMode || 'todos');
+    if(target) return items;
+    // "Todos": esconde o que ja foi pago em meses passados
+    return items.filter(function(r){ var mk = r.dueDate.getFullYear()+'-'+pad2(r.dueDate.getMonth()+1); return !(r.paid && mk < cur); });
+  }
+
+  function reminderRowHTML(r){
+    var col = r.owner ? ownerColor(r.owner) : 'var(--border)';
+    var dot = r.owner ? '<span class="owner-dot" style="background:'+col+'"></span> ' : '';
+    var tipoTag = r.isReceita ? ' <span class="tag">receita</span>' : (r.kind==='invoice' ? ' <span class="tag">cartão</span>' : '');
+    return '<div class="list-item" style="border-left-color:'+col+'"><div class="li-main"><div class="li-title">'+dot+esc(r.title)+tipoTag+ownerTagHTML(r.owner)+'</div><div class="li-sub">'+esc(r.sub)+'</div></div>'
+      + '<span class="badge '+r.status.cls+'">'+r.status.label+'</span><div class="li-value '+(r.isReceita?'entrada':'')+'">'+(r.isReceita?'+':'')+fmtBRL(r.value)+'</div></div>';
   }
 
   function sortReminders(items, sortMode){
@@ -438,15 +482,6 @@
     else if(sortMode === 'data'){ arr.sort(function(a,b){ return a.dueDate.getTime()-b.dueDate.getTime(); }); }
     else{ arr.sort(function(a,b){ if(a.status.order!==b.status.order) return a.status.order-b.status.order; return a.dueDate.getTime()-b.dueDate.getTime(); }); }
     return arr;
-  }
-  function filterRemindersByMonth(items, monthMode){
-    var cur = currentMonthKey();
-    var target = monthMode==='anterior' ? shiftMonth(cur,-1) : (monthMode==='proximo' ? shiftMonth(cur,1) : (monthMode==='atual' ? cur : null));
-    return items.filter(function(r){
-      var mk = r.dueDate.getFullYear()+'-'+pad2(r.dueDate.getMonth()+1);
-      if(target) return mk === target;
-      return !(r.paid && mk < cur); // "Todos": esconde o que ja foi pago em meses passados
-    });
   }
 
   // ---------- filters (report/transactions) ----------
@@ -569,7 +604,7 @@
 
   // ---------- persistence ----------
   function setSaveStatus(msg){ state.saveStatus = msg; var el = document.getElementById('save-status'); if(el) el.textContent = msg; }
-  var EPHEMERAL_KEYS = ['editing','confirmingDeleteKey','payingCycle','launchingBillId','txDraft','billDraft','navOpen','expandedCards','billsMonth','saveStatus'];
+  var EPHEMERAL_KEYS = ['editing','confirmingDeleteKey','payingCycle','launchingBillId','txDraft','billDraft','navOpen','expandedCards','billsMonth','saveStatus','vencimentosMonth'];
 
   function loadState(){
     if(!isConfigured()){
@@ -616,7 +651,7 @@
         tab: state.tab, filterTitular: state.filterTitular, accounts: state.accounts, cards: state.cards,
         transactions: state.transactions, fixedBills: state.fixedBills, categories: state.categories, incomeCategories: state.incomeCategories, presenteCategories: state.presenteCategories,
         titularColors: state.titularColors, budgets: state.budgets, reportFilter: state.reportFilter,
-        vencimentosSort: state.vencimentosSort, vencimentosMonth: state.vencimentosMonth, txFilter: state.txFilter
+        vencimentosSort: state.vencimentosSort, txFilter: state.txFilter
       };
       fetch(CONFIG.API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(toSave) })
         .then(function(){ setSaveStatus('Salvo'); })
@@ -695,10 +730,7 @@
     if(reminders.length === 0){
       html += '<div class="empty">Nenhuma conta fixa ou fatura pendente no momento.</div>';
     }else{
-      html += '<div class="list">' + reminders.map(function(r){
-        return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(r.title)+'</div><div class="li-sub">'+esc(r.sub)+'</div></div>'
-          + '<span class="badge '+r.status.cls+'">'+r.status.label+'</span><div class="li-value">'+fmtBRL(r.value)+'</div></div>';
-      }).join('') + '</div>';
+      html += '<div class="list">' + reminders.map(reminderRowHTML).join('') + '</div>';
     }
 
     var mk = currentMonthKey();
@@ -719,29 +751,40 @@
 
   // ---------- vencimentos ----------
   function renderVencimentos(){
+    var vm = state.vencimentosMonth;
+    var isTodos = vm === 'todos';
     var html = '<div class="form-row" style="margin-bottom:14px;">'
+      + '<div><label>Mês de vencimento</label><div class="month-picker"><button type="button" data-action="venc-month-prev">&lt;</button><span class="label">'+(isTodos?'Todos pendentes':monthLabel(vm))+'</span><button type="button" data-action="venc-month-next">&gt;</button></div></div>'
+      + '<div><label>&nbsp;</label><div class="li-actions">'
+      +   (vm===currentMonthKey() ? '' : '<button type="button" class="btn btn-ghost btn-small" data-action="venc-month-today">Mês atual</button>')
+      +   (isTodos ? '' : '<button type="button" class="btn btn-ghost btn-small" data-action="venc-month-all">Ver todos pendentes</button>')
+      + '</div></div>'
       + '<div><label>Ordenar por</label><select data-action="vencimentos-sort-change">'
       + '<option value="status" '+(state.vencimentosSort==='status'?'selected':'')+'>Urgência</option>'
       + '<option value="data" '+(state.vencimentosSort==='data'?'selected':'')+'>Data</option>'
       + '<option value="valor" '+(state.vencimentosSort==='valor'?'selected':'')+'>Valor</option>'
-      + '</select></div>'
-      + '<div><label>Mês</label><select data-action="vencimentos-month-change">'
-      + '<option value="todos" '+(state.vencimentosMonth==='todos'?'selected':'')+'>Todos</option>'
-      + '<option value="anterior" '+(state.vencimentosMonth==='anterior'?'selected':'')+'>Mês anterior</option>'
-      + '<option value="atual" '+(state.vencimentosMonth==='atual'?'selected':'')+'>Mês atual</option>'
-      + '<option value="proximo" '+(state.vencimentosMonth==='proximo'?'selected':'')+'>Próximo mês</option>'
       + '</select></div></div>';
 
-    var reminders = sortReminders(getReminders(state.vencimentosMonth), state.vencimentosSort);
-    if(reminders.length === 0){
-      html += '<div class="empty">Nada encontrado com esses filtros.</div>';
-    }else{
-      html += '<div class="list">' + reminders.map(function(r){
-        return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(r.title)+'</div><div class="li-sub">'+esc(r.sub)+'</div></div>'
-          + '<span class="badge '+r.status.cls+'">'+r.status.label+'</span><div class="li-value">'+fmtBRL(r.value)+'</div></div>';
-      }).join('') + '</div>';
+    var reminders = sortReminders(getReminders(vm), state.vencimentosSort);
+    if(reminders.length){
+      var aPagar=0, pago=0, aReceber=0, recebido=0;
+      reminders.forEach(function(r){
+        if(r.isReceita){ if(r.paid) recebido += r.value; else aReceber += r.value; }
+        else { if(r.paid) pago += r.value; else aPagar += r.value; }
+      });
+      html += '<div class="summary-grid">'
+        + '<div class="mini-card"><div class="name">A pagar</div><div class="val" style="color:var(--red)">'+fmtBRL(aPagar)+'</div></div>'
+        + (isTodos ? '' : '<div class="mini-card"><div class="name">Já pago</div><div class="val">'+fmtBRL(pago)+'</div></div>')
+        + '<div class="mini-card"><div class="name">A receber</div><div class="val" style="color:var(--green)">'+fmtBRL(aReceber)+'</div></div>'
+        + (isTodos ? '' : '<div class="mini-card"><div class="name">Já recebido</div><div class="val">'+fmtBRL(recebido)+'</div></div>')
+        + '</div>';
     }
-    html += '<div class="settings-note" style="margin-top:16px;">Essa lista junta as contas fixas (mês anterior, atual e próximo), a fatura em aberto, a última fatura fechada e qualquer fatura antiga que ainda tenha saldo a pagar. Em \"Todos\", o que já foi pago em meses passados fica oculto. Para pagar uma fatura, use a aba Cartões. Para lançar uma conta fixa, use a aba Contas Fixas.</div>';
+    if(reminders.length === 0){
+      html += '<div class="empty">Nada encontrado '+(isTodos?'pendente.':'com vencimento em '+monthLabel(vm)+'.')+'</div>';
+    }else{
+      html += '<div class="list">' + reminders.map(reminderRowHTML).join('') + '</div>';
+    }
+    html += '<div class="settings-note" style="margin-top:16px;">Ao escolher um mês, aparecem as contas fixas daquele mês e as faturas de cartão que <b>vencem</b> nele (em aberto, fechadas ou futuras). Em "Todos pendentes" aparecem as contas fixas do mês anterior, atual e próximo, a fatura em aberto e as faturas que ainda têm saldo. O filtro de titular no topo também vale aqui. Para pagar uma fatura, use a aba Cartões; para lançar uma conta fixa, use a aba Contas Fixas.</div>';
     return html;
   }
 
@@ -983,7 +1026,7 @@
             var isFuture = ck > openCycleKey(c);
             var label = ck === openCycleKey(c) ? 'Em aberto (parcial)' : (ck < openCycleKey(c) ? 'Fechada' : 'Futura (só parcelas já lançadas)');
             var badge = restante <= 0 && total > 0 ? '<span class="badge paid">Paga</span>' : (ck < openCycleKey(c) && total > 0 ? '<span class="badge '+computeStatus(due, paid/(total||1)).cls+'">'+computeStatus(due, paid/(total||1)).label+'</span>' : '');
-            var row = '<div class="list-item"><div class="li-main"><div class="li-title">'+label+' - '+monthLabel(ck)+'</div><div class="li-sub">Vence em '+fmtDateObj(due)+(paid>0?' - já pago: '+fmtBRL(paid):'')+'</div></div>'
+            var row = '<div class="list-item" style="border-left-color:'+ownerColor(c.titular)+'"><div class="li-main"><div class="li-title">'+label+' - '+monthLabel(ck)+'</div><div class="li-sub">Vence em '+fmtDateObj(due)+(paid>0?' - já pago: '+fmtBRL(paid):'')+'</div></div>'
               + badge + '<div class="li-value">'+fmtBRL(Math.max(0,restante))+'</div></div>';
             if(restante > 0 && !isFuture){
               var accOpts = state.accounts.map(function(a){return '<option value="'+a.id+'">'+esc(a.name)+(a.titular?' ('+esc(a.titular)+')':'')+'</option>';}).join('');
@@ -1063,8 +1106,8 @@
         + (totRec>0 ? '<div class="mini-card"><div class="name">Receitas fixas (recebido)</div><div class="val" style="color:var(--green)">'+fmtBRL(totRec)+' <span style="font-size:11px;color:var(--text-dim)">('+fmtBRL(recebido)+')</span></div></div>' : '')
         + '</div>';
       var sorted = monthBills.slice().sort(function(a,b){
-        var sa = computeStatus(fixedBillDueDate(a,bm), billIsPaidInMonth(a,bm)?1:0);
-        var sb = computeStatus(fixedBillDueDate(b,bm), billIsPaidInMonth(b,bm)?1:0);
+        var sa = computeStatus(fixedBillDueDate(a,bm), billIsPaidInMonth(a,bm)?1:0, a.natureza==='receita');
+        var sb = computeStatus(fixedBillDueDate(b,bm), billIsPaidInMonth(b,bm)?1:0, b.natureza==='receita');
         if(sa.order!==sb.order) return sa.order-sb.order;
         return a.dueDay-b.dueDay;
       });
@@ -1073,7 +1116,9 @@
         var viaTransaction = billTransactionMonths(b).indexOf(bm) !== -1;
         var viaManual = (b.manuallyPaidMonths||[]).indexOf(bm) !== -1;
         var due = fixedBillDueDate(b, bm);
-        var st = computeStatus(due, paidThisMonth?1:0);
+        var isRecB = b.natureza==='receita';
+        var st = computeStatus(due, paidThisMonth?1:0, isRecB);
+        var ownerB = billOwner(b);
         var delKey = 'bill:'+b.id;
         var confirming = state.confirmingDeleteKey === delKey;
         var parc = billParcelaLabel(b, bm);
@@ -1082,11 +1127,11 @@
         var isLaunching = state.launchingBillId === b.id;
         var menuOpen = state.openBillMenu === b.id;
 
-        var row = '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(b.name)+parcelaInfo+(b.natureza==='receita'?' <span class="tag">receita</span>':'')+'</div>'
-          + '<div class="li-sub">Vence em '+fmtDateObj(due)+(b.natureza==='receita'?'':' - '+(formaLabel?formaLabel.l:''))+'</div></div>'
+        var row = '<div class="list-item" style="border-left-color:'+(ownerB?ownerColor(ownerB):'var(--border)')+'"><div class="li-main"><div class="li-title">'+esc(b.name)+parcelaInfo+(isRecB?' <span class="tag">receita</span>':'')+ownerTagHTML(ownerB)+'</div>'
+          + '<div class="li-sub">'+(isRecB?'Recebe em ':'Vence em ')+fmtDateObj(due)+(isRecB?'':' - '+(formaLabel?formaLabel.l:''))+'</div></div>'
           + '<span class="badge '+st.cls+'">'+st.label+'</span><div class="li-value '+(b.natureza==='receita'?'entrada':'saida')+'">'+fmtBRL(billValueInMonth(b, bm))+'</div>'
           + '<div class="li-actions">'
-          + (paidThisMonth ? '' : '<button type="button" class="btn btn-primary btn-small" data-action="start-launch" data-id="'+b.id+'">Lançar</button>')
+          + (paidThisMonth ? '' : '<button type="button" class="btn btn-primary btn-small" data-action="start-launch" data-id="'+b.id+'">'+(isRecB?'Receber':'Lançar')+'</button>')
           + '<button type="button" class="icon-btn" data-action="toggle-bill-menu" data-id="'+b.id+'">&#8942;</button>'
           + '</div></div>';
 
@@ -1094,8 +1139,8 @@
           row += '<div class="li-actions" style="justify-content:flex-end;margin-top:-4px;">'
             + '<button type="button" class="icon-btn" data-action="edit-bill" data-id="'+b.id+'">Editar</button>'
             + (viaTransaction ? '' : (viaManual
-                ? '<button type="button" class="icon-btn" data-action="toggle-manual-paid" data-id="'+b.id+'">Desmarcar como pago</button>'
-                : '<button type="button" class="icon-btn" data-action="toggle-manual-paid" data-id="'+b.id+'">Marcar como pago (sem descontar)</button>'))
+                ? '<button type="button" class="icon-btn" data-action="toggle-manual-paid" data-id="'+b.id+'">'+(isRecB?'Desmarcar como recebido':'Desmarcar como pago')+'</button>'
+                : '<button type="button" class="icon-btn" data-action="toggle-manual-paid" data-id="'+b.id+'">'+(isRecB?'Marcar como recebido (sem somar)':'Marcar como pago (sem descontar)')+'</button>'))
             + (b.endMonth
                 ? '<button type="button" class="icon-btn" data-action="bill-end" data-id="'+b.id+'" data-mode="clear">Remover encerramento</button>'
                 : '<button type="button" class="icon-btn" data-action="bill-end" data-id="'+b.id+'" data-mode="set">Encerrar a partir deste mês</button>')
@@ -1351,6 +1396,12 @@
     }
     if(action==='cancel-edit'){ state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft(); state.openBillMenu=null; render(); return; }
     if(action==='toggle-bill-menu'){ state.openBillMenu = (state.openBillMenu===btn.dataset.id) ? null : btn.dataset.id; render(); return; }
+    if(action==='venc-month-prev' || action==='venc-month-next'){
+      var baseV = state.vencimentosMonth==='todos' ? currentMonthKey() : state.vencimentosMonth;
+      state.vencimentosMonth = shiftMonth(baseV, action==='venc-month-prev' ? -1 : 1); render(); return;
+    }
+    if(action==='venc-month-today'){ state.vencimentosMonth = currentMonthKey(); render(); return; }
+    if(action==='venc-month-all'){ state.vencimentosMonth = 'todos'; render(); return; }
     if(action==='bills-month-prev' || action==='bills-month-next' || action==='bills-month-today'){
       state.billsMonth = action==='bills-month-today' ? currentMonthKey() : shiftMonth(state.billsMonth, action==='bills-month-prev' ? -1 : 1);
       state.launchingBillId = null; state.openBillMenu = null; render(); return;
@@ -1521,7 +1572,6 @@
     else if(t.dataset.action === 'bill-natureza-change'){ render(); }
     else if(t.dataset.action === 'bill-forma-change'){ render(); }
     else if(t.dataset.action === 'vencimentos-sort-change'){ state.vencimentosSort = t.value; persist(); render(); }
-    else if(t.dataset.action === 'vencimentos-month-change'){ state.vencimentosMonth = t.value; persist(); render(); }
     else if(t.dataset.action === 'report-mode-change'){ state.reportFilter.mode = t.value; render(); }
     else if(t.dataset.action === 'report-from-change'){ state.reportFilter.from = t.value; render(); }
     else if(t.dataset.action === 'report-to-change'){ state.reportFilter.to = t.value; render(); }
