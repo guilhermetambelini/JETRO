@@ -141,14 +141,15 @@
 
   var DEFAULT_CATEGORIES = ['Alimentação','Mercado','Transporte','Moradia','Lazer','Saúde','Educação','Assinaturas','Vestuário','Pets','Presentes','Outros'];
   var DEFAULT_INCOME_CATEGORIES = ['Salário','Prestação de serviço','Presentes','Renda extra','Outros'];
-  var DEFAULT_PRESENTE_CATEGORIES = ['Dízimo','Oferta','Presente','Doação','Caridade','Outros'];
+  var PRESENTE_CATEGORIES = ['Dízimos','Ofertas'];
+  var DEFAULT_PRESENTE_CATEGORIES = PRESENTE_CATEGORIES;
   var FORMAS = ['Cartão de Crédito','Pix','Débito','Dinheiro'];
   var FORMAS_RECEITA = ['Pix','Dinheiro'];
   var PAGAMENTO_FATURA_FORMA = 'Pagamento de Fatura';
   var TIPOS = [
     { v:'saida', l:'Saída (gasto)' },
     { v:'entrada', l:'Entrada (receita)' },
-    { v:'presente', l:'Presente / Doação' },
+    { v:'presente', l:'Dízimos / Ofertas' },
     { v:'investimento', l:'Investimento' },
     { v:'transferencia', l:'Transferência entre contas' }
   ];
@@ -164,7 +165,9 @@
   var NAV_TABS = [['overview','Visão geral'],['vencimentos','Vencimentos'],['transactions','Lançamentos'],['accounts','Contas'],['cards','Cartões'],['bills','Contas fixas'],['report','Relatório'],['settings','Ajustes']];
 
   function freshTxDraft(){ return { value:'', date: todayISO(), desc:'', category: '', forma: FORMAS[0], tipo:'saida', accountId:'', cardId:'', origemId:'', destinoId:'', installments:'1', invoiceCycleOverride:'', applyToFollowing:false }; }
-  function freshBillDraft(){ return { name:'', natureza:'despesa', value:'', dueDay:'', tipoRecorrencia:'eterna', totalParcelas:'12', forma:'debito_automatico', cardId:'', accountId:'' }; }
+  function freshBillDraft(){ return { name:'', natureza:'despesa', value:'', dueDay:'', tipoRecorrencia:'eterna', totalParcelas:'12', forma:'debito_automatico', cardId:'', accountId:'', startMonth:'' }; }
+  function defaultReportFilter(){ return { mode:'month', month: currentMonthKey(), from:'', to:'', tipo:'saida', categoria:'', conta:'', cartao:'' }; }
+  function defaultTxFilter(){ return { tipo:'', categoria:'', conta:'', cartao:'' }; }
 
   var state = {
     tab: 'overview',
@@ -179,7 +182,9 @@
     presenteCategories: DEFAULT_PRESENTE_CATEGORIES.slice(),
     titularColors: Object.assign({}, DEFAULT_COLORS),
     budgets: {},
-    reportFilter: { mode:'month', month: currentMonthKey(), from:'', to:'', categoria:'', conta:'', cartao:'' },
+    reportFilter: defaultReportFilter(),
+    txFilter: defaultTxFilter(),
+    billsMonth: currentMonthKey(),
     vencimentosSort: 'status',
     vencimentosMonth: 'todos',
     txMonth: currentMonthKey(),
@@ -285,6 +290,25 @@
     return total;
   }
   function cyclePaid(card, ck){ return (card.paymentsByCycle && card.paymentsByCycle[ck]) || 0; }
+  function isInvoicePayment(t){ return !!t && t.forma === PAGAMENTO_FATURA_FORMA; }
+  function invoicePaymentInfo(t){
+    if(!isInvoicePayment(t)) return null;
+    if(t.paidCardId && t.paidCycleKey) return { cardId:t.paidCardId, ck:t.paidCycleKey };
+    // lancamentos antigos: deduz pelo texto "<cartao> - Pagamento de fatura (<mes> de <ano>)"
+    var m = /^(.*) - Pagamento de fatura \((\S+) de (\d{4})\)$/.exec(t.desc||'');
+    if(!m) return null;
+    var mi = MONTHS_PT.indexOf(m[2]);
+    var card = state.cards.filter(function(c){ return c.name===m[1]; })[0];
+    if(mi<0 || !card) return null;
+    return { cardId:card.id, ck: m[3]+'-'+pad2(mi+1) };
+  }
+  function revertInvoicePayment(t){
+    var info = invoicePaymentInfo(t); if(!info) return;
+    var card = state.cards.filter(function(c){ return c.id===info.cardId; })[0];
+    if(!card || !card.paymentsByCycle) return;
+    var left = Math.round(((card.paymentsByCycle[info.ck]||0) - Number(t.value))*100)/100;
+    if(left > 0.009) card.paymentsByCycle[info.ck] = left; else delete card.paymentsByCycle[info.ck];
+  }
   function closedCycleKey(card){
     var now=new Date(); var y=now.getFullYear(), m=now.getMonth()+1;
     var closing = cardClosingDate(card,y,m);
@@ -331,11 +355,13 @@
     return { label: paidFraction>0 ? 'Parcial - a vencer' : 'A vencer', cls:'upcoming', order:2 };
   }
 
+  function billTxMonth(t){ return t.billMonth || t.date.slice(0,7); }
   function billTransactionMonths(bill){
     var set = {};
-    state.transactions.forEach(function(t){ if(t.billId===bill.id) set[t.date.slice(0,7)] = true; });
+    state.transactions.forEach(function(t){ if(t.billId===bill.id) set[billTxMonth(t)] = true; });
     return Object.keys(set);
   }
+  function billTransactionsInMonth(bill, mk){ return state.transactions.filter(function(t){ return t.billId===bill.id && billTxMonth(t)===mk; }); }
   function billPaidMonthsCombined(bill){
     var set = {};
     billTransactionMonths(bill).forEach(function(mk){ set[mk]=true; });
@@ -344,45 +370,66 @@
   }
   function billIsPaidInMonth(bill, mk){ return billPaidMonthsCombined(bill).indexOf(mk) !== -1; }
 
-  function activeFixedBills(){
-    return state.fixedBills.filter(function(b){
-      if(b.tipoRecorrencia === 'parcelada'){
-        return billPaidMonthsCombined(b).length < (b.totalParcelas||1);
-      }
-      return true;
-    });
+  function monthDiff(a, b){ var pa=a.split('-').map(Number), pb=b.split('-').map(Number); return (pb[0]-pa[0])*12 + (pb[1]-pa[1]); }
+  function billActiveInMonth(b, mk){
+    if(b.startMonth && mk < b.startMonth) return false;
+    if(b.endMonth && mk > b.endMonth) return false;
+    if(b.tipoRecorrencia === 'parcelada'){
+      var total = b.totalParcelas || 1;
+      if(b.startMonth) return monthDiff(b.startMonth, mk) < total;
+      if(billIsPaidInMonth(b, mk)) return true;
+      return billPaidMonthsCombined(b).length < total;
+    }
+    return true;
   }
-
-  function fixedBillDueDate(bill){
-    var now = new Date(); var y=now.getFullYear(), m=now.getMonth()+1;
-    var day = Math.min(bill.dueDay||1, daysInMonth(y,m));
-    return new Date(y, m-1, day);
+  function billParcelaLabel(b, mk){
+    if(b.tipoRecorrencia !== 'parcelada') return '';
+    if(b.startMonth) return (monthDiff(b.startMonth, mk)+1) + '/' + b.totalParcelas;
+    return billPaidMonthsCombined(b).length + '/' + b.totalParcelas;
   }
+  function billsForMonth(mk){ return state.fixedBills.filter(function(b){ return billActiveInMonth(b, mk); }); }
+  function activeFixedBills(){ return billsForMonth(currentMonthKey()); }
+  function billValueInMonth(b, mk){
+    var txs = billTransactionsInMonth(b, mk);
+    if(txs.length) return txs.reduce(function(s,t){ return s + Number(t.value); }, 0);
+    return Number(b.value) || 0;
+  }
+  function fixedBillDueDate(bill, mk){
+    var p = (mk || currentMonthKey()).split('-').map(Number);
+    var day = Math.min(bill.dueDay||1, daysInMonth(p[0],p[1]));
+    return new Date(p[0], p[1]-1, day);
+  }
+  function earliestBillMonth(b){ var m = billPaidMonthsCombined(b).sort(); return m[0] || ''; }
 
-  function getReminders(){
-    var mk = currentMonthKey();
-    var map = {};
-    activeFixedBills().forEach(function(b){
-      var key = 'bill:'+b.id;
-      if(map[key]) return;
-      var due = fixedBillDueDate(b);
-      var paid = billIsPaidInMonth(b, mk);
-      var st = computeStatus(due, paid ? 1 : 0);
-      map[key] = { title:b.name, sub:(b.natureza==='receita'?'Receita fixa':'Despesa fixa')+' - vence dia '+b.dueDay, value:b.value, status:st, dueDate:due, kind:'bill', id:b.id };
+  function getReminders(monthMode){
+    var cur = currentMonthKey();
+    var items = [];
+    [shiftMonth(cur,-1), cur, shiftMonth(cur,1)].forEach(function(mk){
+      billsForMonth(mk).forEach(function(b){
+        var due = fixedBillDueDate(b, mk);
+        var paid = billIsPaidInMonth(b, mk);
+        var parc = billParcelaLabel(b, mk);
+        items.push({ title:b.name+(parc?' ('+parc+')':''), sub:(b.natureza==='receita'?'Receita fixa':'Despesa fixa')+' - vence em '+fmtDateObj(due), value:billValueInMonth(b, mk), status:computeStatus(due, paid?1:0), dueDate:due, kind:'bill', id:b.id, paid:paid });
+      });
     });
     state.cards.forEach(function(c){
-      var ck = closedCycleKey(c);
-      var total = cardInvoiceTotal(c, ck);
-      if(total > 0){
-        var key = 'invoice:'+c.id+':'+ck;
-        if(map[key]) return;
+      var openCk = openCycleKey(c), closedCk = closedCycleKey(c);
+      var set = {}; set[openCk] = true; set[closedCk] = true;
+      // faturas antigas que ainda tem saldo em aberto
+      state.transactions.forEach(function(t){ if(t.cardId===c.id && t.invoiceCycleKey && t.invoiceCycleKey < closedCk) set[t.invoiceCycleKey] = true; });
+      Object.keys(set).forEach(function(ck){
+        var total = cardInvoiceTotal(c, ck);
+        if(total <= 0) return;
         var paid = cyclePaid(c, ck);
-        var due = invoiceDueDate(c, parseCycleKey(ck));
-        var st = computeStatus(due, paid/total);
-        map[key] = { title:c.name+' - Fatura', sub:'Vence em '+fmtDateObj(due), value: total-paid, status:st, dueDate:due, kind:'invoice', id:c.id };
-      }
+        var restante = total - paid;
+        if(ck < closedCk && restante <= 0.009) return;
+        var cyc = parseCycleKey(ck);
+        var due = invoiceDueDate(c, cyc);
+        var isOpen = ck === openCk;
+        items.push({ title:c.name+' - Fatura'+(isOpen?' (em aberto)':''), sub:(isOpen?'Fecha em '+fmtDateObj(cardClosingDate(c, cyc.year, cyc.month))+' - ':'')+'Vence em '+fmtDateObj(due), value:Math.max(0,restante), status:computeStatus(due, paid/total), dueDate:due, kind:'invoice', id:c.id, paid: restante <= 0.009 });
+      });
     });
-    return Object.keys(map).map(function(k){ return map[k]; });
+    return filterRemindersByMonth(items, monthMode || 'todos');
   }
 
   function sortReminders(items, sortMode){
@@ -393,28 +440,44 @@
     return arr;
   }
   function filterRemindersByMonth(items, monthMode){
-    if(monthMode === 'todos') return items;
-    var now = new Date();
-    var targetMk = currentMonthKey();
-    if(monthMode === 'anterior') targetMk = shiftMonth(targetMk, -1);
-    if(monthMode === 'proximo') targetMk = shiftMonth(targetMk, 1);
-    return items.filter(function(r){ return (r.dueDate.getFullYear()+'-'+pad2(r.dueDate.getMonth()+1)) === targetMk; });
+    var cur = currentMonthKey();
+    var target = monthMode==='anterior' ? shiftMonth(cur,-1) : (monthMode==='proximo' ? shiftMonth(cur,1) : (monthMode==='atual' ? cur : null));
+    return items.filter(function(r){
+      var mk = r.dueDate.getFullYear()+'-'+pad2(r.dueDate.getMonth()+1);
+      if(target) return mk === target;
+      return !(r.paid && mk < cur); // "Todos": esconde o que ja foi pago em meses passados
+    });
   }
 
   // ---------- filters (report/transactions) ----------
-  function matchesReportFilters(t){
-    var f = state.reportFilter;
+  function matchesFilter(t, f){
+    if(!f) return true;
     if(f.categoria && t.category !== f.categoria) return false;
     if(f.conta && t.accountId !== f.conta) return false;
     if(f.cartao && t.cardId !== f.cartao) return false;
     return true;
   }
-  function categoryTotalsInRange(fromDate, toDate){
+  function matchesTipoFilter(t, tipo){
+    if(!tipo) return true;
+    if(tipo === 'transferencia') return !!t.isTransfer;
+    return !t.isTransfer && t.tipo === tipo;
+  }
+  // pagamento de fatura nao conta como gasto (as compras do cartao ja contam)
+  function countsAsReportTx(t, tipo){ return t.tipo === tipo && !t.isTransfer && !isInvoicePayment(t); }
+  function categoryListForTipo(tipo){
+    var base = tipo==='entrada' ? state.incomeCategories : (tipo==='presente' ? PRESENTE_CATEGORIES : (tipo==='saida' || tipo==='investimento' ? state.categories : state.categories.concat(state.incomeCategories, PRESENTE_CATEGORIES)));
+    var set = {}, out = [];
+    base.forEach(function(c){ if(!set[c]){ set[c]=true; out.push(c); } });
+    state.transactions.forEach(function(t){ if(t.category && !set[t.category] && matchesTipoFilter(t, tipo)){ set[t.category]=true; out.push(t.category); } });
+    return out;
+  }
+  function categoryTotalsInRange(fromDate, toDate, tipo, f){
+    tipo = tipo || 'saida';
     var map = {};
     for(var i=0;i<state.transactions.length;i++){
       var t = state.transactions[i];
-      if(t.tipo !== 'saida' || t.isTransfer) continue;
-      if(!matchesReportFilters(t)) continue;
+      if(!countsAsReportTx(t, tipo)) continue;
+      if(!matchesFilter(t, f)) continue;
       var d = toLocalDate(t.date);
       if(d.getTime()>=fromDate.getTime() && d.getTime()<=toDate.getTime()) map[t.category] = (map[t.category]||0)+Number(t.value);
     }
@@ -422,12 +485,12 @@
     arr.sort(function(a,b){ return b[1]-a[1]; });
     return arr;
   }
-  function totalByTipoInRange(tipo, fromDate, toDate){
+  function totalByTipoInRange(tipo, fromDate, toDate, f){
     var total = 0;
     for(var i=0;i<state.transactions.length;i++){
       var t = state.transactions[i];
-      if(t.tipo !== tipo || t.isTransfer) continue;
-      if(!matchesReportFilters(t)) continue;
+      if(!countsAsReportTx(t, tipo)) continue;
+      if(!matchesFilter(t, f)) continue;
       var d = toLocalDate(t.date);
       if(d.getTime()>=fromDate.getTime() && d.getTime()<=toDate.getTime()) total += Number(t.value);
     }
@@ -451,13 +514,13 @@
     if(f.mode==='custom') return (f.from?fmtDate(f.from):'...')+' até '+(f.to?fmtDate(f.to):'...');
     return '';
   }
-  function last6MonthsTrend(){
+  function last6MonthsTrend(tipo, f){
     var out = [];
     for(var i=5;i>=0;i--){
       var mk = shiftMonth(currentMonthKey(),-i);
       var p = mk.split('-').map(Number);
       var from = new Date(p[0],p[1]-1,1), to = new Date(p[0],p[1],0);
-      out.push({ label: MONTHS_SHORT_PT[p[1]-1]+'/'+String(p[0]).slice(2), total: totalByTipoInRange('saida', from, to) });
+      out.push({ label: MONTHS_SHORT_PT[p[1]-1]+'/'+String(p[0]).slice(2), total: totalByTipoInRange(tipo || 'saida', from, to, f) });
     }
     return out;
   }
@@ -501,12 +564,12 @@
   }
   function seedBillDraft(b){
     if(!b) return freshBillDraft();
-    return { name:b.name, natureza:b.natureza, value:b.value, dueDay:b.dueDay, tipoRecorrencia:b.tipoRecorrencia, totalParcelas:b.totalParcelas||'12', forma:b.forma, cardId:b.cardId||'', accountId:b.accountId||'' };
+    return { name:b.name, natureza:b.natureza, value:b.value, dueDay:b.dueDay, tipoRecorrencia:b.tipoRecorrencia, totalParcelas:b.totalParcelas||'12', forma:b.forma, cardId:b.cardId||'', accountId:b.accountId||'', startMonth:b.startMonth||earliestBillMonth(b)||'' };
   }
 
   // ---------- persistence ----------
   function setSaveStatus(msg){ state.saveStatus = msg; var el = document.getElementById('save-status'); if(el) el.textContent = msg; }
-  var EPHEMERAL_KEYS = ['editing','confirmingDeleteKey','payingCycle','launchingBillId','txDraft','billDraft','navOpen','expandedCards'];
+  var EPHEMERAL_KEYS = ['editing','confirmingDeleteKey','payingCycle','launchingBillId','txDraft','billDraft','navOpen','expandedCards','billsMonth','saveStatus'];
 
   function loadState(){
     if(!isConfigured()){
@@ -524,9 +587,17 @@
         if(!state.presenteCategories || !state.presenteCategories.length) state.presenteCategories = DEFAULT_PRESENTE_CATEGORIES.slice();
         if(!state.titularColors) state.titularColors = Object.assign({}, DEFAULT_COLORS);
         if(!state.budgets) state.budgets = {};
-        if(!state.reportFilter.categoria) state.reportFilter.categoria = '';
-        if(!state.reportFilter.conta) state.reportFilter.conta = '';
-        if(!state.reportFilter.cartao) state.reportFilter.cartao = '';
+        state.presenteCategories = PRESENTE_CATEGORIES.slice();
+        state.reportFilter = Object.assign(defaultReportFilter(), state.reportFilter || {});
+        state.txFilter = Object.assign(defaultTxFilter(), state.txFilter || {});
+        // migra categorias antigas de dizimo/oferta
+        (state.transactions||[]).forEach(function(t){
+          if(t.tipo !== 'presente') return;
+          if(t.category === 'Dízimo') t.category = 'Dízimos';
+          if(t.category === 'Oferta') t.category = 'Ofertas';
+        });
+        // contas fixas antigas ganham um mes de inicio (1o mes lancado, ou o mes atual)
+        (state.fixedBills||[]).forEach(function(b){ if(!b.startMonth) b.startMonth = earliestBillMonth(b) || currentMonthKey(); });
       }
       render();
     }).catch(function(err){
@@ -545,7 +616,7 @@
         tab: state.tab, filterTitular: state.filterTitular, accounts: state.accounts, cards: state.cards,
         transactions: state.transactions, fixedBills: state.fixedBills, categories: state.categories, incomeCategories: state.incomeCategories, presenteCategories: state.presenteCategories,
         titularColors: state.titularColors, budgets: state.budgets, reportFilter: state.reportFilter,
-        vencimentosSort: state.vencimentosSort, vencimentosMonth: state.vencimentosMonth
+        vencimentosSort: state.vencimentosSort, vencimentosMonth: state.vencimentosMonth, txFilter: state.txFilter
       };
       fetch(CONFIG.API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(toSave) })
         .then(function(){ setSaveStatus('Salvo'); })
@@ -620,7 +691,7 @@
     }
 
     html += '<div class="section-title">Próximos vencimentos</div>';
-    var reminders = sortReminders(getReminders(), 'status').slice(0,6);
+    var reminders = sortReminders(getReminders('todos').filter(function(r){ return !r.paid; }), 'status').slice(0,6);
     if(reminders.length === 0){
       html += '<div class="empty">Nenhuma conta fixa ou fatura pendente no momento.</div>';
     }else{
@@ -632,7 +703,7 @@
 
     var mk = currentMonthKey();
     var range = { from: toLocalDate(mk+'-01'), to: new Date(new Date().getFullYear(), new Date().getMonth()+1, 0) };
-    var cats = categoryTotalsInRange(range.from, range.to).slice(0,5);
+    var cats = categoryTotalsInRange(range.from, range.to, 'saida', null).slice(0,5);
     html += '<div class="section-title">Maiores gastos do mês</div>';
     if(cats.length === 0){
       html += '<div class="empty">Nenhum gasto lançado neste mês ainda.</div>';
@@ -661,8 +732,7 @@
       + '<option value="proximo" '+(state.vencimentosMonth==='proximo'?'selected':'')+'>Próximo mês</option>'
       + '</select></div></div>';
 
-    var reminders = filterRemindersByMonth(getReminders(), state.vencimentosMonth);
-    reminders = sortReminders(reminders, state.vencimentosSort);
+    var reminders = sortReminders(getReminders(state.vencimentosMonth), state.vencimentosSort);
     if(reminders.length === 0){
       html += '<div class="empty">Nada encontrado com esses filtros.</div>';
     }else{
@@ -671,7 +741,7 @@
           + '<span class="badge '+r.status.cls+'">'+r.status.label+'</span><div class="li-value">'+fmtBRL(r.value)+'</div></div>';
       }).join('') + '</div>';
     }
-    html += '<div class="settings-note" style="margin-top:16px;">Essa lista junta contas fixas ativas e faturas de cartão fechadas ainda não quitadas. Para pagar uma fatura, use a aba Cartões. Para lançar uma conta fixa, use a aba Contas Fixas.</div>';
+    html += '<div class="settings-note" style="margin-top:16px;">Essa lista junta as contas fixas (mês anterior, atual e próximo), a fatura em aberto, a última fatura fechada e qualquer fatura antiga que ainda tenha saldo a pagar. Em \"Todos\", o que já foi pago em meses passados fica oculto. Para pagar uma fatura, use a aba Cartões. Para lançar uma conta fixa, use a aba Contas Fixas.</div>';
     return html;
   }
 
@@ -680,12 +750,15 @@
     var d = state.txDraft;
     var isTransfer = d.tipo === 'transferencia';
     var isReceita = d.tipo === 'entrada';
-    var formaList = isReceita ? FORMAS_RECEITA : FORMAS;
+    var isEditing = state.editing.type === 'transaction';
+    var formaList = (isReceita ? FORMAS_RECEITA : FORMAS).slice();
+    // ao editar, mantem formas especiais (ex.: Boleto / Debito automatico vindos de contas fixas)
+    if(isEditing && !isTransfer && d.forma && formaList.indexOf(d.forma) === -1) formaList.push(d.forma);
     if(!isTransfer && formaList.indexOf(d.forma) === -1) d.forma = formaList[0];
     var isCard = !isTransfer && d.forma === 'Cartão de Crédito';
     var isPresente = d.tipo === 'presente';
-    var categoryList = isReceita ? state.incomeCategories : (isPresente ? state.presenteCategories : state.categories);
-    var isEditing = state.editing.type === 'transaction';
+    var categoryList = isReceita ? state.incomeCategories : (isPresente ? PRESENTE_CATEGORIES : state.categories);
+    if(isEditing && d.category && categoryList.indexOf(d.category) === -1) categoryList = categoryList.concat([d.category]);
     var editingT = isEditing ? state.transactions.filter(function(t){return t.id===state.editing.id;})[0] : null;
     var descHint = !isEditing ? findAutocompleteMatch(d.desc) : null;
 
@@ -701,7 +774,7 @@
       + '<div class="form-row">'
       + '<div><label>Descrição'+(isTransfer?' (opcional)':'')+'</label><input list="desc-list" type="text" name="desc" placeholder="Ex: Spotify" '+(isTransfer?'':'required')+' autocomplete="off" value="'+esc(d.desc)+'">'
       +   '<datalist id="desc-list">'+ Array.from(new Set(state.transactions.map(function(t){return t.desc;}))).map(function(x){return '<option value="'+esc(x)+'">';}).join('') +'</datalist>'
-      +   (descHint ? '<div class="autocomplete-hint">Igual a um lançamento anterior - categoria preenchida automaticamente. Ajuste se precisar.</div>' : '')
+      +   '<div class="autocomplete-hint" id="autocomplete-hint" style="'+(descHint?'':'display:none;')+'">Igual a um lançamento anterior - categoria preenchida automaticamente. Ajuste se precisar.</div>'
       + '</div>'
       + (isTransfer ? '' : '<div><label>Categoria</label><select name="category" required>'+ (categoryList.length ? optionsHTML(categoryList, categoryList.indexOf(d.category)!==-1?d.category:(descHint&&categoryList.indexOf(descHint.category)!==-1?descHint.category:categoryList[0])) : '<option value="">Cadastre categorias em Ajustes</option>') +'</select></div>')
       + '</div>'
@@ -727,20 +800,22 @@
       + '<button type="submit" class="btn btn-primary">'+(isEditing?'Salvar alterações':'Adicionar lançamento')+'</button>'
       + '</div></form>';
 
-    var f = state.reportFilter;
+    var tf = state.txFilter;
+    var tfCats = categoryListForTipo(tf.tipo);
     html += '<div class="section-title">Histórico</div>';
     html += '<div class="form-row" style="margin-bottom:10px;">'
       + '<div><label>Mês</label><div class="month-picker"><button type="button" data-action="tx-month-prev">&lt;</button><span class="label">'+(state.txMonth==='todos'?'Todos os meses':monthLabel(state.txMonth))+'</span><button type="button" data-action="tx-month-next">&gt;</button></div></div>'
       + '<div><label>&nbsp;</label><button type="button" class="btn btn-ghost btn-small" data-action="tx-month-all">Ver todos os meses</button></div>'
       + '</div>';
     html += '<div class="form-row" style="margin-bottom:10px;">'
-      + '<div><label>Filtrar categoria</label><select data-action="tx-filter-categoria"><option value="">Todas</option>'+optionsHTML(state.categories, f.categoria)+'</select></div>'
-      + '<div><label>Filtrar conta</label><select data-action="tx-filter-conta"><option value="">Todas</option>'+ state.accounts.map(function(a){return '<option value="'+a.id+'" '+(f.conta===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('') +'</select></div>'
-      + '<div><label>Filtrar cartão</label><select data-action="tx-filter-cartao"><option value="">Todos</option>'+ state.cards.map(function(c){return '<option value="'+c.id+'" '+(f.cartao===c.id?'selected':'')+'>'+esc(c.name)+'</option>';}).join('') +'</select></div>'
+      + '<div><label>Filtrar tipo</label><select data-action="tx-filter-tipo"><option value="">Todos</option>'+ TIPOS.map(function(o){ return '<option value="'+o.v+'" '+(tf.tipo===o.v?'selected':'')+'>'+o.l+'</option>'; }).join('') +'</select></div>'
+      + '<div><label>Filtrar categoria</label><select data-action="tx-filter-categoria"><option value="">Todas</option>'+optionsHTML(tfCats, tf.categoria)+'</select></div>'
+      + '<div><label>Filtrar conta</label><select data-action="tx-filter-conta"><option value="">Todas</option>'+ state.accounts.map(function(a){return '<option value="'+a.id+'" '+(tf.conta===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('') +'</select></div>'
+      + '<div><label>Filtrar cartão</label><select data-action="tx-filter-cartao"><option value="">Todos</option>'+ state.cards.map(function(c){return '<option value="'+c.id+'" '+(tf.cartao===c.id?'selected':'')+'>'+esc(c.name)+'</option>';}).join('') +'</select></div>'
       + '</div>';
 
     var seenTransfer = {};
-    var all = state.transactions.filter(matchesReportFilters).filter(function(t){
+    var all = state.transactions.filter(function(t){ return matchesFilter(t, tf) && matchesTipoFilter(t, tf.tipo); }).filter(function(t){
       if(state.txMonth !== 'todos' && t.date.slice(0,7) !== state.txMonth) return false;
       if(t.isTransfer){ if(seenTransfer[t.transferId]) return false; seenTransfer[t.transferId] = true; }
       return true;
@@ -773,13 +848,13 @@
         if(t.cardId){ var cc=state.cards.filter(function(c){return c.id===t.cardId;})[0]; place = cc?cc.name:'-'; }
         else if(t.accountId){ var ac=state.accounts.filter(function(a){return a.id===t.accountId;})[0]; place = ac?ac.name:'-'; }
         var parcelaTxt = t.installment ? (' <span class="tag">'+t.installment.current+'/'+t.installment.total+'</span>') : '';
-        var billTag = t.billId ? ' <span class="tag">conta fixa</span>' : '';
+        var billTag = t.billId ? ' <span class="tag">conta fixa</span>' : (isInvoicePayment(t) ? ' <span class="tag">pagamento de fatura</span>' : '');
         var sign = t.tipo==='entrada' ? '+' : '-';
         var groupBtn = t.installmentGroupId ? ('<button type="button" class="icon-btn '+(confirmingGroup?'confirm':'danger')+'" data-action="delete-transaction-group" data-id="'+t.id+'">'+(confirmingGroup?'Confirmar':'Excluir esta e as seguintes')+'</button>') : '';
         return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(t.desc)+parcelaTxt+billTag+'</div>'
           + '<div class="li-sub">'+fmtDate(t.date)+' - '+esc(t.category)+' - '+esc(t.forma)+' - '+esc(place)+'</div></div>'
           + '<div class="li-value '+t.tipo+'">'+sign+fmtBRL(t.value)+'</div>'
-          + '<div class="li-actions"><button type="button" class="icon-btn" data-action="edit-transaction" data-id="'+t.id+'">Editar</button>'
+          + '<div class="li-actions">'+(isInvoicePayment(t) ? '' : '<button type="button" class="icon-btn" data-action="edit-transaction" data-id="'+t.id+'">Editar</button>')
           + '<button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-transaction" data-id="'+t.id+'">'+(confirming?'Confirmar':'Excluir')+'</button>'
           + groupBtn + '</div></div>';
       }).join('') + '</div>';
@@ -872,7 +947,7 @@
       + '<div><label>Dia de vencimento</label><input type="number" name="dueDay" min="1" max="31" required value="'+(editingC?editingC.dueDay:'')+'"></div>'
       + '<div><label>Limite total (R$)</label><input type="number" step="0.01" name="limit" value="'+(editingC?editingC.limit:'0')+'"></div>'
       + '</div>'
-      + '<div class="settings-note">Se o dia de fechamento cair em sábado ou domingo, o app empurra automaticamente para o próximo dia útil (não considera feriados).</div>'
+      + '<div class="settings-note">Se o dia de fechamento ou de vencimento cair em fim de semana ou feriado nacional, o app empurra automaticamente para o próximo dia útil.</div>'
       + '<div class="form-actions">'+(editingC?'<button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>':'')+'<button type="submit" class="btn btn-primary">'+(editingC?'Salvar alterações':'Adicionar cartão')+'</button></div></form>';
 
     html += '<div class="section-title">Seus cartões</div>';
@@ -948,7 +1023,10 @@
       + '<div><label>Natureza</label><select name="natureza" data-action="bill-natureza-change"><option value="despesa" '+(d.natureza==='despesa'?'selected':'')+'>Despesa</option><option value="receita" '+(d.natureza==='receita'?'selected':'')+'>Receita</option></select></div>'
       + '<div><label>Tipo</label><select name="tipoRecorrencia" data-action="bill-tipo-change"><option value="eterna" '+(tipoSel==='eterna'?'selected':'')+'>Recorrente (sem fim)</option><option value="parcelada" '+(tipoSel==='parcelada'?'selected':'')+'>Parcelada (tem fim)</option></select></div>'
       + '</div>'
-      + (tipoSel==='parcelada' ? '<div class="form-row"><div><label>Número de parcelas</label><input type="number" min="2" max="360" name="totalParcelas" value="'+esc(d.totalParcelas||'12')+'"></div><div></div><div></div></div>' : '')
+      + '<div class="form-row">'
+      +   (tipoSel==='parcelada' ? '<div><label>Número de parcelas</label><input type="number" min="2" max="360" name="totalParcelas" value="'+esc(d.totalParcelas||'12')+'"></div>' : '')
+      +   '<div><label>'+(tipoSel==='parcelada'?'Mês da 1ª parcela':'Começa em')+'</label><input type="month" name="startMonth" placeholder="AAAA-MM" value="'+esc(d.startMonth||state.billsMonth)+'"></div>'
+      + '</div>'
       + '<div class="form-row">'
       + '<div><label>Valor padrão (R$)</label><input type="number" step="0.01" min="0.01" name="value" required value="'+esc(d.value)+'"></div>'
       + '<div><label>Dia do vencimento</label><input type="number" min="1" max="31" name="dueDay" required value="'+esc(d.dueDay)+'"></div>'
@@ -963,33 +1041,50 @@
       + '</div>'
       + '<div class="form-actions">'+(isEditing?'<button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>':'')+'<button type="submit" class="btn btn-primary">'+(isEditing?'Salvar alterações':'Adicionar conta fixa')+'</button></div></form>';
 
-    html += '<div class="section-title">Contas fixas ativas</div>';
-    var active = activeFixedBills();
-    if(active.length===0){
-      html += '<div class="empty">Nenhuma conta fixa cadastrada ainda.</div>';
+    var bm = state.billsMonth;
+    var isCurMonth = bm === currentMonthKey();
+    html += '<div class="section-title">Contas fixas do mês'
+      + '<div class="month-picker"><button type="button" data-action="bills-month-prev">&lt;</button><span class="label">'+monthLabel(bm)+'</span><button type="button" data-action="bills-month-next">&gt;</button>'
+      + (isCurMonth ? '' : '<button type="button" data-action="bills-month-today" style="width:auto;padding:0 10px;font-size:12px;">Mês atual</button>')
+      + '</div></div>';
+    var monthBills = billsForMonth(bm);
+    if(monthBills.length===0){
+      html += '<div class="empty">Nenhuma conta fixa em '+monthLabel(bm)+'.</div>';
     }else{
-      var mk = currentMonthKey();
-      var sorted = active.slice().sort(function(a,b){
-        var sa = computeStatus(fixedBillDueDate(a), billIsPaidInMonth(a,mk)?1:0);
-        var sb = computeStatus(fixedBillDueDate(b), billIsPaidInMonth(b,mk)?1:0);
+      var totDesp=0, pagoDesp=0, totRec=0, recebido=0;
+      monthBills.forEach(function(b){
+        var v = billValueInMonth(b, bm), p = billIsPaidInMonth(b, bm);
+        if(b.natureza==='receita'){ totRec += v; if(p) recebido += v; } else { totDesp += v; if(p) pagoDesp += v; }
+      });
+      html += '<div class="summary-grid">'
+        + '<div class="mini-card"><div class="name">Despesas fixas</div><div class="val" style="color:var(--red)">'+fmtBRL(totDesp)+'</div></div>'
+        + '<div class="mini-card"><div class="name">Já pago</div><div class="val">'+fmtBRL(pagoDesp)+'</div></div>'
+        + '<div class="mini-card"><div class="name">Falta pagar</div><div class="val '+(totDesp-pagoDesp>0?'neg':'')+'">'+fmtBRL(totDesp-pagoDesp)+'</div></div>'
+        + (totRec>0 ? '<div class="mini-card"><div class="name">Receitas fixas (recebido)</div><div class="val" style="color:var(--green)">'+fmtBRL(totRec)+' <span style="font-size:11px;color:var(--text-dim)">('+fmtBRL(recebido)+')</span></div></div>' : '')
+        + '</div>';
+      var sorted = monthBills.slice().sort(function(a,b){
+        var sa = computeStatus(fixedBillDueDate(a,bm), billIsPaidInMonth(a,bm)?1:0);
+        var sb = computeStatus(fixedBillDueDate(b,bm), billIsPaidInMonth(b,bm)?1:0);
         if(sa.order!==sb.order) return sa.order-sb.order;
         return a.dueDay-b.dueDay;
       });
       html += '<div class="list">' + sorted.map(function(b){
-        var paidThisMonth = billIsPaidInMonth(b, mk);
-        var viaTransaction = billTransactionMonths(b).indexOf(mk) !== -1;
-        var viaManual = (b.manuallyPaidMonths||[]).indexOf(mk) !== -1;
-        var st = computeStatus(fixedBillDueDate(b), paidThisMonth?1:0);
+        var paidThisMonth = billIsPaidInMonth(b, bm);
+        var viaTransaction = billTransactionMonths(b).indexOf(bm) !== -1;
+        var viaManual = (b.manuallyPaidMonths||[]).indexOf(bm) !== -1;
+        var due = fixedBillDueDate(b, bm);
+        var st = computeStatus(due, paidThisMonth?1:0);
         var delKey = 'bill:'+b.id;
         var confirming = state.confirmingDeleteKey === delKey;
-        var parcelaInfo = b.tipoRecorrencia==='parcelada' ? ' <span class="tag">'+billPaidMonthsCombined(b).length+'/'+b.totalParcelas+'</span>' : '';
+        var parc = billParcelaLabel(b, bm);
+        var parcelaInfo = parc ? ' <span class="tag">'+parc+'</span>' : '';
         var formaLabel = FORMA_FIXA.filter(function(f){return f.v===b.forma;})[0];
         var isLaunching = state.launchingBillId === b.id;
         var menuOpen = state.openBillMenu === b.id;
 
         var row = '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(b.name)+parcelaInfo+(b.natureza==='receita'?' <span class="tag">receita</span>':'')+'</div>'
-          + '<div class="li-sub">Vence dia '+b.dueDay+(b.natureza==='receita'?'':' - '+(formaLabel?formaLabel.l:''))+'</div></div>'
-          + '<span class="badge '+st.cls+'">'+st.label+'</span><div class="li-value '+(b.natureza==='receita'?'entrada':'saida')+'">'+fmtBRL(b.value)+'</div>'
+          + '<div class="li-sub">Vence em '+fmtDateObj(due)+(b.natureza==='receita'?'':' - '+(formaLabel?formaLabel.l:''))+'</div></div>'
+          + '<span class="badge '+st.cls+'">'+st.label+'</span><div class="li-value '+(b.natureza==='receita'?'entrada':'saida')+'">'+fmtBRL(billValueInMonth(b, bm))+'</div>'
           + '<div class="li-actions">'
           + (paidThisMonth ? '' : '<button type="button" class="btn btn-primary btn-small" data-action="start-launch" data-id="'+b.id+'">Lançar</button>')
           + '<button type="button" class="icon-btn" data-action="toggle-bill-menu" data-id="'+b.id+'">&#8942;</button>'
@@ -1001,18 +1096,23 @@
             + (viaTransaction ? '' : (viaManual
                 ? '<button type="button" class="icon-btn" data-action="toggle-manual-paid" data-id="'+b.id+'">Desmarcar como pago</button>'
                 : '<button type="button" class="icon-btn" data-action="toggle-manual-paid" data-id="'+b.id+'">Marcar como pago (sem descontar)</button>'))
-            + '<button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-bill" data-id="'+b.id+'">'+(confirming?'Confirmar':'Excluir')+'</button>'
+            + (b.endMonth
+                ? '<button type="button" class="icon-btn" data-action="bill-end" data-id="'+b.id+'" data-mode="clear">Remover encerramento</button>'
+                : '<button type="button" class="icon-btn" data-action="bill-end" data-id="'+b.id+'" data-mode="set">Encerrar a partir deste mês</button>')
+            + '<button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-bill" data-id="'+b.id+'">'+(confirming?'Confirmar':'Excluir de todos os meses')+'</button>'
             + '</div>';
         }
 
         if(isLaunching){
           var accOptsL = state.accounts.map(function(a){return '<option value="'+a.id+'" '+(b.accountId===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('');
-          row += '<form class="inline-form" data-form="launch-bill" data-bill-id="'+b.id+'" style="margin-top:-2px;">'
-            + '<div class="form-row date-row"><div class="date-field"><label>Data</label><input type="date" name="date" value="'+todayISO()+'" required></div></div>'
+          var defDate = isCurMonth ? todayISO() : (due.getFullYear()+'-'+pad2(due.getMonth()+1)+'-'+pad2(due.getDate()));
+          row += '<form class="inline-form" data-form="launch-bill" data-bill-id="'+b.id+'" data-month="'+bm+'" style="margin-top:-2px;">'
+            + '<div class="form-row date-row"><div class="date-field"><label>Data do pagamento</label><input type="date" name="date" value="'+defDate+'" required></div></div>'
             + '<div class="form-row">'
             + '<div><label>Valor real (R$)</label><input type="number" step="0.01" min="0.01" name="value" value="'+b.value+'" required></div>'
             + (b.forma==='cartao' ? '' : '<div><label>Conta</label><select name="accountId" required>'+(state.accounts.length?accOptsL:'<option value="">Cadastre uma conta primeiro</option>')+'</select></div>')
             + '</div>'
+            + '<div class="settings-note" style="margin:0;">Fica registrada como a conta de '+monthLabel(bm)+', mesmo que a data do pagamento seja em outro mês.</div>'
             + '<div class="form-actions"><button type="button" class="btn btn-ghost btn-small" data-action="cancel-launch">Cancelar</button><button type="submit" class="btn btn-primary btn-small">Confirmar</button></div></form>';
         }
         return row;
@@ -1025,18 +1125,34 @@
   function renderReport(){
     var f = state.reportFilter;
     var range = resolveReportRange();
-    var totals = categoryTotalsInRange(range.from, range.to);
+    var tipoR = f.tipo || 'saida';
+    var totals = categoryTotalsInRange(range.from, range.to, tipoR, f);
     var totalPeriodo = totals.reduce(function(s,c){return s+c[1];}, 0);
-    var totalDoado = totalByTipoInRange('presente', range.from, range.to);
-    var totalInvestido = totalByTipoInRange('investimento', range.from, range.to);
-    var totalEntradaAvulsa = totalByTipoInRange('entrada', range.from, range.to);
+    var fSemCat = Object.assign({}, f, { categoria:'' });
+    var totalDoado = totalByTipoInRange('presente', range.from, range.to, fSemCat);
+    var totalInvestido = totalByTipoInRange('investimento', range.from, range.to, fSemCat);
 
+    // resumo do mes: fixas pelo cadastro (ou valor lancado) + variaveis sem conta fixa, sem contar pagamento de fatura
+    var sm = f.mode==='month' ? f.month : currentMonthKey();
+    var smp = sm.split('-').map(Number);
+    var smFrom = new Date(smp[0], smp[1]-1, 1), smTo = new Date(smp[0], smp[1], 0);
     var receitaFixaPrevista = 0, gastoFixoPrevisto = 0;
-    activeFixedBills().forEach(function(b){
-      if(b.natureza==='receita') receitaFixaPrevista += Number(b.value)||0;
-      else gastoFixoPrevisto += Number(b.value)||0;
+    billsForMonth(sm).forEach(function(b){
+      var v = billValueInMonth(b, sm);
+      if(b.natureza==='receita') receitaFixaPrevista += v; else gastoFixoPrevisto += v;
     });
-    var sobraPrevista = receitaFixaPrevista + totalEntradaAvulsa - gastoFixoPrevisto - totalPeriodo;
+    var totalEntradaAvulsa = 0, gastoVariavel = 0;
+    state.transactions.forEach(function(t){
+      if(t.isTransfer || isInvoicePayment(t) || t.billId) return;
+      var dt = toLocalDate(t.date); if(dt < smFrom || dt > smTo) return;
+      if(t.tipo==='entrada') totalEntradaAvulsa += Number(t.value);
+      else if(t.tipo==='saida') gastoVariavel += Number(t.value);
+    });
+    var dizimosMes = totalByTipoInRange('presente', smFrom, smTo, null);
+    var sobraPrevista = receitaFixaPrevista + totalEntradaAvulsa - gastoFixoPrevisto - gastoVariavel - dizimosMes;
+    var TIPO_LABEL = { saida:'gastos', entrada:'receitas', presente:'dízimos / ofertas', investimento:'investimentos' };
+    var rMonthFrom = range.from.getFullYear()+'-'+pad2(range.from.getMonth()+1), rMonthTo = range.to.getFullYear()+'-'+pad2(range.to.getMonth()+1);
+    var nMonths = Math.max(1, monthDiff(rMonthFrom, rMonthTo) + 1);
 
     var modeSelect = '<select data-action="report-mode-change">'
       + '<option value="month" '+(f.mode==='month'?'selected':'')+'>Mês específico</option>'
@@ -1054,24 +1170,27 @@
     html += '</div>';
 
     html += '<div class="form-row" style="margin-bottom:14px;">'
-      + '<div><label>Categoria</label><select data-action="report-filter-categoria"><option value="">Todas</option>'+optionsHTML(state.categories, f.categoria)+'</select></div>'
+      + '<div><label>Tipo</label><select data-action="report-filter-tipo">'+['saida','entrada','presente','investimento'].map(function(v){ var o = TIPOS.filter(function(x){return x.v===v;})[0]; return '<option value="'+v+'" '+(tipoR===v?'selected':'')+'>'+o.l+'</option>'; }).join('')+'</select></div>'
+      + '<div><label>Categoria</label><select data-action="report-filter-categoria"><option value="">Todas</option>'+optionsHTML(categoryListForTipo(tipoR), f.categoria)+'</select></div>'
       + '<div><label>Conta</label><select data-action="report-filter-conta"><option value="">Todas</option>'+state.accounts.map(function(a){return '<option value="'+a.id+'" '+(f.conta===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('')+'</select></div>'
       + '<div><label>Cartão</label><select data-action="report-filter-cartao"><option value="">Todos</option>'+state.cards.map(function(c){return '<option value="'+c.id+'" '+(f.cartao===c.id?'selected':'')+'>'+esc(c.name)+'</option>';}).join('')+'</select></div>'
       + '</div>';
 
-    html += '<div class="section-title">Resumo fixo x variável (mês atual, com base no cadastro)</div>';
+    html += '<div class="section-title">Resumo fixo x variável - '+monthLabel(sm)+'</div>';
     html += '<div class="summary-grid">'
-      + '<div class="mini-card"><div class="name">Receita fixa prevista</div><div class="val" style="color:var(--green)">'+fmtBRL(receitaFixaPrevista)+'</div></div>'
-      + '<div class="mini-card"><div class="name">Gasto fixo previsto</div><div class="val" style="color:var(--red)">'+fmtBRL(gastoFixoPrevisto)+'</div></div>'
-      + '<div class="mini-card"><div class="name">Renda extra (período)</div><div class="val" style="color:var(--green)">'+fmtBRL(totalEntradaAvulsa)+'</div></div>'
+      + '<div class="mini-card"><div class="name">Receita fixa</div><div class="val" style="color:var(--green)">'+fmtBRL(receitaFixaPrevista)+'</div></div>'
+      + '<div class="mini-card"><div class="name">Renda extra</div><div class="val" style="color:var(--green)">'+fmtBRL(totalEntradaAvulsa)+'</div></div>'
+      + '<div class="mini-card"><div class="name">Gasto fixo</div><div class="val" style="color:var(--red)">'+fmtBRL(gastoFixoPrevisto)+'</div></div>'
+      + '<div class="mini-card"><div class="name">Gastos variáveis</div><div class="val" style="color:var(--red)">'+fmtBRL(gastoVariavel)+'</div></div>'
+      + '<div class="mini-card"><div class="name">Dízimos / ofertas</div><div class="val" style="color:var(--accent2)">'+fmtBRL(dizimosMes)+'</div></div>'
       + '<div class="mini-card"><div class="name">Sobra prevista</div><div class="val '+(sobraPrevista<0?'neg':'')+'">'+fmtBRL(sobraPrevista)+'</div></div>'
       + '</div>';
 
     html += '<div id="report-capture" class="export-surface">';
-    html += '<div class="card"><div class="hero-label">Total de gastos - '+reportRangeLabel()+'</div><div class="hero-value" style="font-size:24px;">'+fmtBRL(totalPeriodo)+'</div></div>';
-    if(totalDoado>0 || totalInvestido>0){
+    html += '<div class="card"><div class="hero-label">Total de '+TIPO_LABEL[tipoR]+' - '+reportRangeLabel()+'</div><div class="hero-value" style="font-size:24px;">'+fmtBRL(totalPeriodo)+'</div></div>';
+    if(tipoR==='saida' && (totalDoado>0 || totalInvestido>0)){
       html += '<div class="summary-grid">'
-        + (totalDoado>0 ? '<div class="mini-card"><div class="name">Total doado / presentes</div><div class="val" style="color:var(--accent2)">'+fmtBRL(totalDoado)+'</div></div>' : '')
+        + (totalDoado>0 ? '<div class="mini-card"><div class="name">Dízimos / ofertas</div><div class="val" style="color:var(--accent2)">'+fmtBRL(totalDoado)+'</div></div>' : '')
         + (totalInvestido>0 ? '<div class="mini-card"><div class="name">Total investido</div><div class="val" style="color:var(--accent2)">'+fmtBRL(totalInvestido)+'</div></div>' : '')
         + '</div>';
     }
@@ -1083,17 +1202,18 @@
 
     html += '<div class="section-title">Detalhamento e orçamento</div>';
     if(totals.length===0){
-      html += '<div class="empty">Nenhum gasto lançado neste período com esses filtros.</div>';
+      html += '<div class="empty">Nenhum lançamento deste tipo no período com esses filtros.</div>';
     }else{
       html += '<div>' + totals.map(function(c){
         var pct = totalPeriodo>0 ? (c[1]/totalPeriodo*100) : 0;
-        var budget = state.budgets[c[0]];
+        var budgetMes = tipoR==='saida' ? state.budgets[c[0]] : 0;
+        var budget = budgetMes ? budgetMes * nMonths : 0; // orcamento mensal x meses do periodo
         var budgetLine = '';
         if(budget){
           var bpct = Math.min(100, (c[1]/budget)*100);
           var over = c[1] > budget;
           budgetLine = '<div class="bar-track" style="margin-top:4px;"><div class="bar-fill '+(over?'over':'')+'" style="width:'+bpct+'%"></div></div>'
-            + '<div style="font-size:11px;color:'+(over?'var(--red)':'var(--text-faint)')+';margin-top:2px;">Orçamento: '+fmtBRL(budget)+(over?' - estourou em '+fmtBRL(c[1]-budget):'')+'</div>';
+            + '<div style="font-size:11px;color:'+(over?'var(--red)':'var(--text-faint)')+';margin-top:2px;">Orçamento: '+fmtBRL(budget)+(nMonths>1?' ('+nMonths+' meses x '+fmtBRL(budgetMes)+')':'')+(over?' - estourou em '+fmtBRL(c[1]-budget):'')+'</div>';
         }
         return '<div class="report-row"><div class="report-head"><span class="report-cat">'+esc(c[0])+'</span><span class="report-val">'+fmtBRL(c[1])+' - '+pct.toFixed(0)+'%</span></div>'
           + '<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%"></div></div>'+budgetLine+'</div>';
@@ -1109,7 +1229,8 @@
     if(state.tab !== 'report') return;
     if(typeof Chart === 'undefined') return;
     var range = resolveReportRange();
-    var totals = categoryTotalsInRange(range.from, range.to);
+    var f = state.reportFilter, tipoR = f.tipo || 'saida';
+    var totals = categoryTotalsInRange(range.from, range.to, tipoR, f);
     var pieEl = document.getElementById('chart-pie');
     if(pieEl){
       if(charts.pie){ charts.pie.destroy(); charts.pie = null; }
@@ -1119,7 +1240,7 @@
     var trendEl = document.getElementById('chart-trend');
     if(trendEl){
       if(charts.trend){ charts.trend.destroy(); charts.trend = null; }
-      var trend = last6MonthsTrend();
+      var trend = last6MonthsTrend(tipoR, f);
       charts.trend = new Chart(trendEl.getContext('2d'), { type:'bar', data:{ labels:trend.map(function(t){return t.label;}), datasets:[{ data:trend.map(function(t){return t.total;}), backgroundColor:'#6EE7C7', borderRadius:4 }] }, options:{ plugins:{ legend:{ display:false } }, scales:{ x:{ ticks:{ color:'#8A93A6' }, grid:{ display:false } }, y:{ ticks:{ color:'#8A93A6' }, grid:{ color:'#24304A' } } } } });
     }
   }
@@ -1145,17 +1266,6 @@
         var confirming = state.confirmingDeleteKey === delKey;
         return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(cat)+'</div></div>'
           + '<div class="li-actions"><button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-income-category" data-id="'+esc(cat)+'">'+(confirming?'Confirmar':'Excluir')+'</button></div></div>';
-      }).join('') + '</div>';
-    }
-
-    html += '<div class="section-title">Categorias de presente / doação<button type="button" class="icon-btn" data-action="toggle-presente-categories-open">'+(state.presenteCategoriesOpen?'Recolher':'('+state.presenteCategories.length+') Ver / editar')+'</button></div>';
-    if(state.presenteCategoriesOpen){
-      html += '<form class="inline-form" data-form="add-presente-category"><div class="form-row"><div><label>Nova categoria de presente/doação</label><input type="text" name="name" placeholder="Ex: Ajuda a amigo" required></div></div><div class="form-actions"><button type="submit" class="btn btn-primary btn-small">Adicionar categoria</button></div></form>';
-      html += '<div class="list">' + state.presenteCategories.map(function(cat){
-        var delKey = 'presente-category:'+cat;
-        var confirming = state.confirmingDeleteKey === delKey;
-        return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(cat)+'</div></div>'
-          + '<div class="li-actions"><button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-presente-category" data-id="'+esc(cat)+'">'+(confirming?'Confirmar':'Excluir')+'</button></div></div>';
       }).join('') + '</div>';
     }
 
@@ -1241,10 +1351,21 @@
     }
     if(action==='cancel-edit'){ state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft(); state.openBillMenu=null; render(); return; }
     if(action==='toggle-bill-menu'){ state.openBillMenu = (state.openBillMenu===btn.dataset.id) ? null : btn.dataset.id; render(); return; }
+    if(action==='bills-month-prev' || action==='bills-month-next' || action==='bills-month-today'){
+      state.billsMonth = action==='bills-month-today' ? currentMonthKey() : shiftMonth(state.billsMonth, action==='bills-month-prev' ? -1 : 1);
+      state.launchingBillId = null; state.openBillMenu = null; render(); return;
+    }
+    if(action==='bill-end'){
+      var billE = state.fixedBills.filter(function(x){return x.id===btn.dataset.id;})[0];
+      if(!billE) return;
+      var modeE = btn.dataset.mode;
+      update(function(){ if(modeE==='clear') delete billE.endMonth; else billE.endMonth = shiftMonth(state.billsMonth, -1); state.openBillMenu = null; });
+      return;
+    }
     if(action==='toggle-manual-paid'){
       var billId2 = btn.dataset.id;
       var bill2 = state.fixedBills.filter(function(x){return x.id===billId2;})[0];
-      var mk2 = currentMonthKey();
+      var mk2 = state.billsMonth;
       update(function(){
         bill2.manuallyPaidMonths = bill2.manuallyPaidMonths || [];
         var idx = bill2.manuallyPaidMonths.indexOf(mk2);
@@ -1319,6 +1440,7 @@
           var delId = btn.dataset.id;
           update(function(){
             var tgt = state.transactions.filter(function(x){return x.id===delId;})[0];
+            if(tgt && isInvoicePayment(tgt)) revertInvoicePayment(tgt);
             if(tgt && tgt.isTransfer && tgt.transferId){
               state.transactions = state.transactions.filter(function(x){return x.transferId!==tgt.transferId;});
             }else{
@@ -1343,11 +1465,41 @@
     }
   });
 
+  function setSelectIfOption(sel, val){
+    if(!sel || !val) return false;
+    for(var i=0;i<sel.options.length;i++){ if(sel.options[i].value===val){ sel.value = val; return true; } }
+    return false;
+  }
+  function applyAutocomplete(form){
+    if(state.editing.type === 'transaction') return;
+    var d = state.txDraft;
+    var m = findAutocompleteMatch(d.desc);
+    var hint = form.querySelector('#autocomplete-hint');
+    if(!m || m.isTransfer || isInvoicePayment(m) || m.billId || m.tipo !== d.tipo){ if(hint) hint.style.display = 'none'; return; }
+    var formaList = d.tipo==='entrada' ? FORMAS_RECEITA : FORMAS;
+    var formaChanged = m.forma && formaList.indexOf(m.forma)!==-1 && m.forma !== d.forma;
+    if(formaChanged) d.forma = m.forma;
+    if(m.category) d.category = m.category;
+    if(m.cardId) d.cardId = m.cardId;
+    if(m.accountId) d.accountId = m.accountId;
+    if(formaChanged){
+      // muda os campos do formulario (ex.: conta -> cartao), entao redesenha e devolve o foco
+      render();
+      var inp = document.querySelector('form[data-form="transaction"] input[name="desc"]');
+      if(inp){ inp.focus(); var L = inp.value.length; try{ inp.setSelectionRange(L, L); }catch(err){} }
+      return;
+    }
+    setSelectIfOption(form.querySelector('select[name="category"]'), m.category);
+    setSelectIfOption(form.querySelector('select[name="accountId"]'), m.accountId);
+    if(setSelectIfOption(form.querySelector('select[name="cardId"]'), m.cardId)) refreshCycleOptions(form);
+    if(hint) hint.style.display = '';
+  }
+
   document.addEventListener('input', function(e){
     var t = e.target;
     if(!t.name) return;
     var txForm = t.closest('form[data-form="transaction"]');
-    if(txForm){ state.txDraft[t.name] = t.value; if(t.name==='date'){ refreshCycleOptions(txForm); } return; }
+    if(txForm){ state.txDraft[t.name] = t.value; if(t.name==='date'){ refreshCycleOptions(txForm); } if(t.name==='desc'){ applyAutocomplete(txForm); } return; }
     var billForm = t.closest('form[data-form="bill"]');
     if(billForm){ state.billDraft[t.name] = t.value; return; }
   });
@@ -1376,9 +1528,11 @@
     else if(t.dataset.action === 'report-filter-categoria'){ state.reportFilter.categoria = t.value; persist(); render(); }
     else if(t.dataset.action === 'report-filter-conta'){ state.reportFilter.conta = t.value; persist(); render(); }
     else if(t.dataset.action === 'report-filter-cartao'){ state.reportFilter.cartao = t.value; persist(); render(); }
-    else if(t.dataset.action === 'tx-filter-categoria'){ state.reportFilter.categoria = t.value; persist(); render(); }
-    else if(t.dataset.action === 'tx-filter-conta'){ state.reportFilter.conta = t.value; persist(); render(); }
-    else if(t.dataset.action === 'tx-filter-cartao'){ state.reportFilter.cartao = t.value; persist(); render(); }
+    else if(t.dataset.action === 'report-filter-tipo'){ state.reportFilter.tipo = t.value; if(categoryListForTipo(t.value).indexOf(state.reportFilter.categoria)===-1) state.reportFilter.categoria=''; persist(); render(); }
+    else if(t.dataset.action === 'tx-filter-tipo'){ state.txFilter.tipo = t.value; if(categoryListForTipo(t.value).indexOf(state.txFilter.categoria)===-1) state.txFilter.categoria=''; persist(); render(); }
+    else if(t.dataset.action === 'tx-filter-categoria'){ state.txFilter.categoria = t.value; persist(); render(); }
+    else if(t.dataset.action === 'tx-filter-conta'){ state.txFilter.conta = t.value; persist(); render(); }
+    else if(t.dataset.action === 'tx-filter-cartao'){ state.txFilter.cartao = t.value; persist(); render(); }
     else if(t.dataset.action === 'titular-color-change'){ update(function(){ state.titularColors[t.dataset.titular] = t.value; }); }
   });
 
@@ -1424,13 +1578,15 @@
       var forma = natureza==='receita' ? 'debito_automatico' : fd.get('forma');
       var cardId = forma==='cartao' ? fd.get('cardId') : null;
       var accountId = forma!=='cartao' ? (fd.get('accountId')||null) : null;
+      var startMonth = (fd.get('startMonth')||'').trim();
+      if(!/^\d{4}-\d{2}$/.test(startMonth)) startMonth = state.billsMonth;
       if(!bname || !bvalue) return;
       update(function(){
         if(id){
           var b = state.fixedBills.filter(function(x){return x.id===id;})[0];
-          b.name=bname; b.natureza=natureza; b.value=bvalue; b.dueDay=bDueDay; b.tipoRecorrencia=tipoRecorrencia; b.totalParcelas=totalParcelas; b.forma=forma; b.cardId=cardId; b.accountId=accountId;
+          b.name=bname; b.natureza=natureza; b.value=bvalue; b.dueDay=bDueDay; b.tipoRecorrencia=tipoRecorrencia; b.totalParcelas=totalParcelas; b.forma=forma; b.cardId=cardId; b.accountId=accountId; b.startMonth=startMonth;
         }else{
-          state.fixedBills.push({ id:uid(), name:bname, natureza:natureza, value:bvalue, dueDay:bDueDay, tipoRecorrencia:tipoRecorrencia, totalParcelas:totalParcelas, forma:forma, cardId:cardId, accountId:accountId, manuallyPaidMonths:[] });
+          state.fixedBills.push({ id:uid(), name:bname, natureza:natureza, value:bvalue, dueDay:bDueDay, tipoRecorrencia:tipoRecorrencia, totalParcelas:totalParcelas, forma:forma, cardId:cardId, accountId:accountId, startMonth:startMonth, manuallyPaidMonths:[] });
         }
         state.editing={type:null,id:null,transferId:null}; state.billDraft=freshBillDraft();
       });
@@ -1443,7 +1599,7 @@
       var amount = parseFloat(fd.get('amount'));
       if(!card || !accountId2 || !amount) return;
       update(function(){
-        state.transactions.push({ id:uid(), value:amount, date:todayISO(), desc:card.name+' - Pagamento de fatura ('+monthLabel(ck)+')', category:'Fatura de cartão', forma:PAGAMENTO_FATURA_FORMA, tipo:'saida', accountId:accountId2, cardId:null, invoiceCycleKey:null, installment:null });
+        state.transactions.push({ id:uid(), value:amount, date:todayISO(), desc:card.name+' - Pagamento de fatura ('+monthLabel(ck)+')', category:'Fatura de cartão', forma:PAGAMENTO_FATURA_FORMA, tipo:'saida', accountId:accountId2, cardId:null, invoiceCycleKey:null, installment:null, paidCardId:card.id, paidCycleKey:ck });
         card.paymentsByCycle = card.paymentsByCycle || {};
         card.paymentsByCycle[ck] = (card.paymentsByCycle[ck]||0) + amount;
         state.payingCycle = null;
@@ -1457,10 +1613,10 @@
       var lvalue = parseFloat(fd.get('value'));
       var laccountId = fd.get('accountId');
       if(!bill || !lvalue) return;
-      var mk = ldate.slice(0,7);
+      var billMonth = form.dataset.month || ldate.slice(0,7);
       update(function(){
         var tipo = bill.natureza==='receita' ? 'entrada' : 'saida';
-        var tx = { id:uid(), value:lvalue, date:ldate, desc:bill.name, category: bill.natureza==='receita'?'Receita fixa':'Contas fixas', forma: bill.forma==='cartao'?'Cartão de Crédito':(bill.forma==='boleto'?'Boleto':'Débito automático'), tipo:tipo, accountId:null, cardId:null, invoiceCycleKey:null, installment:null, billId:bill.id };
+        var tx = { id:uid(), value:lvalue, date:ldate, desc:bill.name, category: bill.natureza==='receita'?'Receita fixa':'Contas fixas', forma: bill.forma==='cartao'?'Cartão de Crédito':(bill.forma==='boleto'?'Boleto':'Débito automático'), tipo:tipo, accountId:null, cardId:null, invoiceCycleKey:null, installment:null, billId:bill.id, billMonth:billMonth };
         if(bill.forma === 'cartao' && bill.cardId){
           var cardObj = state.cards.filter(function(c){return c.id===bill.cardId;})[0];
           if(cardObj){ tx.cardId = bill.cardId; tx.invoiceCycleKey = cycleKey(invoiceCycleForDate(cardObj, toLocalDate(ldate))); }
@@ -1542,8 +1698,6 @@
       if(!value || !desc || !category) return;
       if(isCard && !cardId) return;
       if(!isCard && !accountId) return;
-      var targetCategoryList = isReceita ? state.incomeCategories : (isPresente ? state.presenteCategories : state.categories);
-      if(category && targetCategoryList.indexOf(category)===-1) targetCategoryList.push(category);
 
       update(function(){
         if(id){
