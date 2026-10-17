@@ -606,58 +606,168 @@
   function setSaveStatus(msg){ state.saveStatus = msg; var el = document.getElementById('save-status'); if(el) el.textContent = msg; }
   var EPHEMERAL_KEYS = ['editing','confirmingDeleteKey','payingCycle','launchingBillId','txDraft','billDraft','navOpen','expandedCards','billsMonth','saveStatus','vencimentosMonth'];
 
-  function loadState(){
+  // ---------- senha (fica so neste aparelho, nunca no codigo) ----------
+  var SENHA_KEY = 'jetro_senha';
+  function getSenha(){ try{ return localStorage.getItem(SENHA_KEY) || ''; }catch(e){ return ''; } }
+  function setSenha(v){ try{ if(v) localStorage.setItem(SENHA_KEY, v); else localStorage.removeItem(SENHA_KEY); }catch(e){} }
+
+  function renderLogin(msg){
+    document.getElementById('app').innerHTML = '<div style="max-width:360px;margin:60px auto;">'
+      + '<div class="nav-panel-title" style="text-align:center;font-size:22px;">JETRO</div>'
+      + '<form class="inline-form" data-form="login">'
+      + '<div><label>Senha</label><input type="password" name="senha" required autocomplete="current-password" autofocus></div>'
+      + (msg ? '<div style="font-size:12px;color:var(--red);">'+esc(msg)+'</div>' : '')
+      + '<div class="settings-note" style="margin:0;">A senha fica guardada só neste aparelho. Para tirar, use "Sair deste aparelho" em Ajustes.</div>'
+      + '<div class="form-actions"><button type="submit" class="btn btn-primary">Entrar</button></div>'
+      + '</form></div>';
+  }
+
+  function api(acao, extra){
+    var body = Object.assign({ acao:acao, senha:getSenha() }, extra || {});
+    return fetch(CONFIG.API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body) })
+      .then(function(r){ return r.json(); });
+  }
+
+  function handleApiError(res){
+    if(res.erro === 'senha'){ setSenha(''); renderLogin('Senha incorreta.'); return true; }
+    if(res.erro === 'bloqueado'){ renderLogin('Muitas tentativas erradas. Aguarde 15 minutos e tente de novo.'); return true; }
+    if(res.erro === 'sem_senha_configurada'){ renderLogin('A senha ainda não foi configurada no Apps Script (propriedade APP_SENHA).'); return true; }
+    if(res.erro === 'use_post'){ renderLogin('O Apps Script ainda está na versão antiga. Publique a nova versão (Implantar > Gerenciar implantações).'); return true; }
+    return false;
+  }
+
+  var dataVersion = 0;     // versao dos dados no servidor
+  var baseSnapshot = null; // ultimo estado que sabemos estar salvo no servidor
+  var saving = false, saveAgain = false;
+
+  function snapshot(){
+    return JSON.parse(JSON.stringify({
+      tab: state.tab, filterTitular: state.filterTitular, accounts: state.accounts, cards: state.cards,
+      transactions: state.transactions, fixedBills: state.fixedBills, categories: state.categories, incomeCategories: state.incomeCategories, presenteCategories: state.presenteCategories,
+      titularColors: state.titularColors, budgets: state.budgets, reportFilter: state.reportFilter,
+      vencimentosSort: state.vencimentosSort, txFilter: state.txFilter
+    }));
+  }
+
+  function applySaved(saved){
+    if(!saved || typeof saved !== 'object') return;
+    Object.keys(saved).forEach(function(k){
+      if(EPHEMERAL_KEYS.indexOf(k) === -1) state[k] = saved[k];
+    });
+    if(!state.accounts) state.accounts = [];
+    if(!state.cards) state.cards = [];
+    if(!state.transactions) state.transactions = [];
+    if(!state.fixedBills) state.fixedBills = [];
+    if(!state.categories || !state.categories.length) state.categories = DEFAULT_CATEGORIES.slice();
+    if(!state.incomeCategories || !state.incomeCategories.length) state.incomeCategories = DEFAULT_INCOME_CATEGORIES.slice();
+    if(!state.titularColors) state.titularColors = Object.assign({}, DEFAULT_COLORS);
+    if(!state.budgets) state.budgets = {};
+    if(!state.tab || !sectionRenderers[state.tab]) state.tab = 'overview';
+    state.presenteCategories = PRESENTE_CATEGORIES.slice();
+    state.reportFilter = Object.assign(defaultReportFilter(), state.reportFilter || {});
+    state.txFilter = Object.assign(defaultTxFilter(), state.txFilter || {});
+    // migra categorias antigas de dizimo/oferta
+    state.transactions.forEach(function(t){
+      if(t.tipo !== 'presente') return;
+      if(t.category === 'Dízimo') t.category = 'Dízimos';
+      if(t.category === 'Oferta') t.category = 'Ofertas';
+    });
+    // contas fixas antigas ganham um mes de inicio (1o mes lancado, ou o mes atual)
+    state.fixedBills.forEach(function(b){ if(!b.startMonth) b.startMonth = earliestBillMonth(b) || currentMonthKey(); });
+  }
+
+  // junta as alteracoes deste aparelho (local x base) com o que outro aparelho salvou (remote)
+  var ID_LISTS = ['accounts','cards','transactions','fixedBills'];
+  function mergeStates(base, local, remote){
+    var out = {};
+    var keys = {};
+    [base, local, remote].forEach(function(o){ Object.keys(o||{}).forEach(function(k){ keys[k]=true; }); });
+    Object.keys(keys).forEach(function(k){
+      var b = base ? base[k] : undefined, l = local[k], r = remote[k];
+      if(ID_LISTS.indexOf(k) !== -1){
+        var bm = {}, lm = {}; (b||[]).forEach(function(x){ bm[x.id]=x; }); (l||[]).forEach(function(x){ lm[x.id]=x; });
+        var result = [], seen = {};
+        (r||[]).forEach(function(x){
+          seen[x.id] = true;
+          if(bm[x.id] && !lm[x.id]) return;                                              // apagado aqui
+          if(lm[x.id] && (!bm[x.id] || JSON.stringify(lm[x.id]) !== JSON.stringify(bm[x.id]))) result.push(lm[x.id]); // editado aqui
+          else result.push(x);
+        });
+        (l||[]).forEach(function(x){ if(!seen[x.id] && !bm[x.id]) result.push(x); });     // criado aqui
+        out[k] = result;
+      }else{
+        out[k] = JSON.stringify(l) !== JSON.stringify(b) ? l : r;
+      }
+    });
+    return out;
+  }
+
+  function loadState(silent){
     if(!isConfigured()){
       document.getElementById('app').innerHTML = '<div class="setup-notice">Este painel ainda não está conectado a uma planilha.<br><br>'
         + 'Procure por <code>CONFIG.API_URL</code> perto do topo do script e cole ali a URL do seu Google Apps Script (termina em <code>/exec</code>).</div>';
-      return;
+      return Promise.resolve();
     }
-    fetch(CONFIG.API_URL).then(function(r){ return r.json(); }).then(function(saved){
-      if(saved && typeof saved === 'object'){
-        Object.keys(saved).forEach(function(k){
-          if(EPHEMERAL_KEYS.indexOf(k) === -1) state[k] = saved[k];
-        });
-        if(!state.categories || !state.categories.length) state.categories = DEFAULT_CATEGORIES.slice();
-        if(!state.incomeCategories || !state.incomeCategories.length) state.incomeCategories = DEFAULT_INCOME_CATEGORIES.slice();
-        if(!state.presenteCategories || !state.presenteCategories.length) state.presenteCategories = DEFAULT_PRESENTE_CATEGORIES.slice();
-        if(!state.titularColors) state.titularColors = Object.assign({}, DEFAULT_COLORS);
-        if(!state.budgets) state.budgets = {};
-        state.presenteCategories = PRESENTE_CATEGORIES.slice();
-        state.reportFilter = Object.assign(defaultReportFilter(), state.reportFilter || {});
-        state.txFilter = Object.assign(defaultTxFilter(), state.txFilter || {});
-        // migra categorias antigas de dizimo/oferta
-        (state.transactions||[]).forEach(function(t){
-          if(t.tipo !== 'presente') return;
-          if(t.category === 'Dízimo') t.category = 'Dízimos';
-          if(t.category === 'Oferta') t.category = 'Ofertas';
-        });
-        // contas fixas antigas ganham um mes de inicio (1o mes lancado, ou o mes atual)
-        (state.fixedBills||[]).forEach(function(b){ if(!b.startMonth) b.startMonth = earliestBillMonth(b) || currentMonthKey(); });
-      }
+    if(!getSenha()){ renderLogin(); return Promise.resolve(); }
+    if(!silent) setSaveStatus('Atualizando...');
+    return api('ler').then(function(res){
+      if(!res || res.ok !== true){ if(!handleApiError(res||{})) setSaveStatus('Erro ao carregar'); return; }
+      dataVersion = res.versao || 0;
+      baseSnapshot = JSON.parse(JSON.stringify(res.dados || {}));
+      applySaved(res.dados || {});
+      setSaveStatus('');
       render();
     }).catch(function(err){
+      if(silent){ setSaveStatus('Sem conexão'); return; }
       document.getElementById('app').innerHTML = '<div class="setup-notice">Não foi possível carregar os dados agora.<br>'
-        + 'Verifique a URL em <code>CONFIG.API_URL</code> e se a implantação está com acesso "Qualquer pessoa".<br><br>'
+        + 'Verifique a internet, a URL em <code>CONFIG.API_URL</code> e se a implantação está com acesso "Qualquer pessoa".<br><br>'
         + '<span style="font-size:11px;color:var(--text-faint)">'+esc(String(err))+'</span></div>';
+    });
+  }
+
+  function doSave(tries){
+    tries = tries || 0;
+    if(saving){ saveAgain = true; return Promise.resolve(); }
+    saving = true;
+    var toSave = snapshot();
+    return api('salvar', { versao: dataVersion, dados: toSave }).then(function(res){
+      saving = false;
+      if(res && res.ok){
+        dataVersion = res.versao; baseSnapshot = toSave;
+        setSaveStatus('Salvo');
+      }else if(res && res.erro === 'conflito' && tries < 3){
+        // outro aparelho salvou antes: junta as duas versoes e tenta de novo
+        var merged = mergeStates(baseSnapshot, toSave, res.dados || {});
+        dataVersion = res.versao; baseSnapshot = JSON.parse(JSON.stringify(res.dados || {}));
+        applySaved(merged); render();
+        setSaveStatus('Juntando com alterações do outro aparelho...');
+        return doSave(tries + 1);
+      }else if(!handleApiError(res||{})){
+        setSaveStatus('Erro ao salvar - tente de novo');
+      }
+    }).catch(function(err){
+      saving = false;
+      setSaveStatus('Erro ao salvar - sem conexão?'); console.error(err);
+    }).then(function(){
+      if(saveAgain){ saveAgain = false; return doSave(); }
     });
   }
 
   function persist(){
     clearTimeout(saveTimer);
     setSaveStatus('Salvando...');
-    saveTimer = setTimeout(function(){
-      if(!isConfigured()) return;
-      var toSave = {
-        tab: state.tab, filterTitular: state.filterTitular, accounts: state.accounts, cards: state.cards,
-        transactions: state.transactions, fixedBills: state.fixedBills, categories: state.categories, incomeCategories: state.incomeCategories, presenteCategories: state.presenteCategories,
-        titularColors: state.titularColors, budgets: state.budgets, reportFilter: state.reportFilter,
-        vencimentosSort: state.vencimentosSort, txFilter: state.txFilter
-      };
-      fetch(CONFIG.API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(toSave) })
-        .then(function(){ setSaveStatus('Salvo'); })
-        .catch(function(err){ setSaveStatus('Erro ao salvar'); console.error(err); });
-    }, 400);
+    saveTimer = setTimeout(function(){ saveTimer = null; if(isConfigured()) doSave(); }, 400);
   }
+
+  function refreshNow(silent){
+    if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; return doSave().then(function(){ return loadState(silent); }); }
+    if(saving) return Promise.resolve();
+    return loadState(silent);
+  }
+  // ao voltar para o app, busca o que o outro aparelho mudou
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState === 'visible' && getSenha() && baseSnapshot) refreshNow(true);
+  });
   function update(mutator){ mutator(); persist(); render(); }
 
   // ---------- shared render bits ----------
@@ -1339,7 +1449,8 @@
   function settingsHTML(){
     var confirming = state.confirmingDeleteKey === 'reset-all';
     return '<div class="settings-block">'
-      + '<div class="settings-note">Os dados ficam salvos na sua planilha do Google Sheets. Qualquer pessoa com o link do Apps Script consegue ler/gravar - não compartilhe essa URL publicamente.</div>'
+      + '<div class="settings-note">Os dados ficam salvos na sua planilha do Google Sheets e só são lidos/gravados com a senha. Se você usar o app em outro aparelho, a senha é pedida uma vez nele.</div>'
+      + '<button type="button" class="btn btn-ghost" data-action="logout" style="margin-right:8px;">Sair deste aparelho</button>'
       + '<button type="button" class="btn btn-ghost" data-action="reset-all" style="'+(confirming?'color:var(--red);border-color:var(--red);':'')+'">'+(confirming?'Clique novamente para apagar tudo':'Apagar todos os dados')+'</button>'
       + '</div>';
   }
@@ -1447,7 +1558,8 @@
     if(action==='cancel-pay'){ state.payingCycle = null; render(); return; }
     if(action==='start-launch'){ state.launchingBillId = btn.dataset.id; render(); return; }
     if(action==='cancel-launch'){ state.launchingBillId = null; render(); return; }
-    if(action==='refresh-now'){ loadState(); return; }
+    if(action==='refresh-now'){ refreshNow(); return; }
+    if(action==='logout'){ setSenha(''); baseSnapshot = null; renderLogin(); return; }
     if(action==='tx-month-prev'){ state.txMonth = state.txMonth==='todos' ? shiftMonth(currentMonthKey(),-1) : shiftMonth(state.txMonth,-1); render(); return; }
     if(action==='tx-month-next'){ state.txMonth = state.txMonth==='todos' ? shiftMonth(currentMonthKey(),1) : shiftMonth(state.txMonth,1); render(); return; }
     if(action==='tx-month-all'){ state.txMonth = 'todos'; render(); return; }
@@ -1591,6 +1703,14 @@
     if(!form) return;
     e.preventDefault();
     var type = form.dataset.form;
+    if(type === 'login'){
+      var senhaDigitada = (new FormData(form).get('senha') || '').trim();
+      if(!senhaDigitada) return;
+      setSenha(senhaDigitada);
+      document.getElementById('app').innerHTML = '<div class="loading">Carregando seus dados...</div>';
+      loadState();
+      return;
+    }
     var fd = new FormData(form);
     var id = fd.get('id');
 
