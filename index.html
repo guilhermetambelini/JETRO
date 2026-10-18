@@ -113,7 +113,8 @@
   .bar-fill.over{ background:linear-gradient(90deg,var(--amber),var(--red)); }
   .month-picker{ display:flex; align-items:center; gap:8px; margin-bottom:0; }
   .month-picker button{ background:var(--panel); border:1px solid var(--border); color:var(--text); border-radius:8px; width:34px; height:30px; font-size:13px; }
-  .month-picker .label{ font-family:var(--font-mono); font-weight:600; font-size:14px; min-width:120px; text-align:center; text-transform:capitalize; }
+  .month-picker .label{ font-family:var(--font-mono); font-weight:600; font-size:14px; min-width:120px; text-align:center; }
+  .month-picker .label::first-letter{ text-transform:uppercase; }
   .settings-block{ margin-top:30px; padding-top:16px; border-top:1px solid var(--border); }
   .settings-note{ font-size:12px; color:var(--text-faint); margin-bottom:10px; }
   .loading, .setup-notice{ text-align:center; color:var(--text-dim); padding:60px 20px; font-size:13px; }
@@ -126,7 +127,15 @@
   .autocomplete-hint{ font-size:11px; color:var(--accent); margin-top:4px; }
   .card-head{ display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px; cursor:pointer; }
   .expand-btn{ background:var(--panel-2); border:1px solid var(--border); color:var(--text-dim); border-radius:7px; width:30px; height:30px; font-size:13px; flex-shrink:0; }
-  @media (max-width:480px){ .hero{ padding:16px; } }
+  .modal-backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.62); z-index:60; display:flex; align-items:flex-start; justify-content:center; padding:48px 12px 24px; overflow-y:auto; }
+  .modal-box{ background:var(--bg); border:1px solid var(--border); border-radius:14px; width:100%; max-width:640px; padding:16px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+  .modal-head{ display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:12px; font-family:var(--font-display); font-weight:600; font-size:16px; }
+  .modal-box form.inline-form{ margin-bottom:0; }
+  .modal-close{ background:none; border:1px solid var(--border); color:var(--text-dim); border-radius:8px; width:32px; height:32px; font-size:16px; flex-shrink:0; }
+  .title-actions{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .btn-danger{ background:var(--red); border-color:var(--red); color:#fff; }
+  .btn:disabled{ opacity:.4; cursor:not-allowed; }
+  @media (max-width:480px){ .hero{ padding:16px; } .modal-backdrop{ padding:12px 8px; } }
 </style>
 </head>
 <body>
@@ -201,7 +210,14 @@
     incomeCategoriesOpen: false,
     presenteCategoriesOpen: false,
     confirmingDeleteKey: null,
-    saveStatus: ''
+    saveStatus: '',
+    modal: null,
+    backups: null,
+    me: null,
+    users: [],
+    profileMsg: '',
+    passwordMsg: '',
+    codeMsg: ''
   };
   state.txDraft = freshTxDraft();
   state.billDraft = freshBillDraft();
@@ -562,7 +578,7 @@
 
   function allTitulares(){
     var set = {};
-    TITULARES_PADRAO.forEach(function(t){ set[t]=true; });
+    ((state.users && state.users.length) ? state.users.map(function(u){ return u.nome; }) : TITULARES_PADRAO).forEach(function(t){ set[t]=true; });
     state.accounts.forEach(function(a){ if(a.titular) set[a.titular]=true; });
     state.cards.forEach(function(c){ if(c.titular) set[c.titular]=true; });
     return Object.keys(set);
@@ -603,42 +619,104 @@
   }
 
   // ---------- persistence ----------
-  function setSaveStatus(msg){ state.saveStatus = msg; var el = document.getElementById('save-status'); if(el) el.textContent = msg; }
-  var EPHEMERAL_KEYS = ['editing','confirmingDeleteKey','payingCycle','launchingBillId','txDraft','billDraft','navOpen','expandedCards','billsMonth','saveStatus','vencimentosMonth'];
+  function setSaveStatus(msg){ state.saveStatus = msg; var el = document.getElementById('save-status'); if(el){ el.textContent = msg; el.style.color = /^Erro/.test(msg) ? 'var(--red)' : ''; } }
+  var EPHEMERAL_KEYS = ['editing','confirmingDeleteKey','payingCycle','launchingBillId','txDraft','billDraft','navOpen','expandedCards','billsMonth','saveStatus','vencimentosMonth','modal','backups','me','users','profileMsg','passwordMsg','codeMsg','tempPass','removeUser','restoreId'];
 
-  // ---------- senha (fica so neste aparelho, nunca no codigo) ----------
-  var SENHA_KEY = 'jetro_senha';
-  function getSenha(){ try{ return localStorage.getItem(SENHA_KEY) || ''; }catch(e){ return ''; } }
-  function setSenha(v){ try{ if(v) localStorage.setItem(SENHA_KEY, v); else localStorage.removeItem(SENHA_KEY); }catch(e){} }
+  // ---------- login: usuario + senha; o aparelho guarda so um "token" de sessao ----------
+  var TOKEN_KEY = 'jetro_token';
+  try{ localStorage.removeItem('jetro_senha'); }catch(e){} // versao anterior guardava a senha
+  function getToken(){ try{ return localStorage.getItem(TOKEN_KEY) || ''; }catch(e){ return ''; } }
+  function setToken(v){ try{ if(v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); }catch(e){} }
+  function meUser(){ return state.me ? (state.me.id || state.me.usuario) : null; }
+  // aceita o id interno (novo) ou o @usuario
+  function nomeDe(ref){ var u = (state.users||[]).filter(function(x){ return x.id===ref || x.usuario===ref; })[0]; return u ? u.nome : 'pessoa removida'; }
 
-  function renderLogin(msg){
-    document.getElementById('app').innerHTML = '<div style="max-width:360px;margin:60px auto;">'
+  var ERR_MSG = {
+    login:'Usuário ou senha incorretos.',
+    codigo:'Código da família incorreto.',
+    usuario_invalido:'Usuário: de 3 a 20 caracteres, só letras minúsculas, números, ponto ou _ (sem espaço e sem acento).',
+    usuario_em_uso:'Esse usuário já existe. Escolha outro.',
+    nome_em_uso:'Já existe uma pessoa com esse nome.',
+    nome_vazio:'Preencha o nome.',
+    senha_curta:'A senha precisa ter pelo menos 6 caracteres.',
+    senha_atual:'Sua senha está incorreta.',
+    senhas_diferentes:'As duas senhas não são iguais.',
+    codigos_diferentes:'Os dois códigos não são iguais.',
+    codigo_curto:'O código precisa ter pelo menos 6 caracteres.',
+    use_trocar_senha:'Para a sua própria senha, use "Trocar senha" em Minha conta.',
+    bloqueado:'Muitas tentativas erradas. Aguarde 15 minutos e tente de novo.',
+    sem_usuarios:'Ainda não existe nenhuma conta. Crie a primeira abaixo.',
+    sem_codigo_configurado:'O código da família (propriedade APP_SENHA) não está configurado no Apps Script.',
+    use_post:'O Apps Script ainda está na versão antiga. Publique a nova versão (Implantar > Gerenciar implantações).',
+    nao_pode_remover_a_si:'Você não pode remover a sua própria conta.',
+    usuario_nao_encontrado:'Usuário não encontrado.'
+  };
+  function errMsg(code){ return ERR_MSG[code] || ('Erro: ' + (code || 'sem resposta')); }
+
+  function renderLogin(msg, mode){
+    mode = mode || 'entrar';
+    var criar = mode === 'criar';
+    var html = '<div style="max-width:380px;margin:50px auto;">'
       + '<div class="nav-panel-title" style="text-align:center;font-size:22px;">JETRO</div>'
-      + '<form class="inline-form" data-form="login">'
-      + '<div><label>Senha</label><input type="password" name="senha" required autocomplete="current-password" autofocus></div>'
-      + (msg ? '<div style="font-size:12px;color:var(--red);">'+esc(msg)+'</div>' : '')
-      + '<div class="settings-note" style="margin:0;">A senha fica guardada só neste aparelho. Para tirar, use "Sair deste aparelho" em Ajustes.</div>'
-      + '<div class="form-actions"><button type="submit" class="btn btn-primary">Entrar</button></div>'
-      + '</form></div>';
+      + '<div class="li-actions" style="justify-content:center;margin-bottom:12px;">'
+      +   '<button type="button" class="btn btn-small '+(criar?'btn-ghost':'btn-primary')+'" data-action="login-mode" data-mode="entrar">Entrar</button>'
+      +   '<button type="button" class="btn btn-small '+(criar?'btn-primary':'btn-ghost')+'" data-action="login-mode" data-mode="criar">Criar conta</button>'
+      + '</div>';
+    if(!criar){
+      html += '<form class="inline-form" data-form="login">'
+        + '<div><label>Usuário</label><input type="text" name="usuario" required autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="ex.: gui.silva" autofocus></div>'
+        + '<div><label>Senha</label><input type="password" name="senha" required autocomplete="current-password"></div>'
+        + (msg ? '<div style="font-size:12px;color:var(--red);">'+esc(msg)+'</div>' : '')
+        + '<div class="form-actions"><button type="submit" class="btn btn-primary">Entrar</button></div>'
+        + '</form>';
+    }else{
+      html += '<form class="inline-form" data-form="signup">'
+        + '<div><label>Seu nome</label><input type="text" name="nome" required maxlength="40" placeholder="ex.: Guilherme"></div>'
+        + '<div class="settings-note" style="margin:-4px 0 0;">Use o mesmo nome que já aparece como titular das contas e cartões, para manter cores e filtros.</div>'
+        + '<div><label>Usuário (para entrar)</label><input type="text" name="usuario" required autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="ex.: gui.silva"></div>'
+        + '<div class="form-row"><div><label>Senha</label><input type="password" name="senha" required minlength="6" autocomplete="new-password"></div>'
+        + '<div><label>Repita a senha</label><input type="password" name="senha2" required minlength="6" autocomplete="new-password"></div></div>'
+        + '<div><label>Código da família</label><input type="password" name="codigo" required autocomplete="off"></div>'
+        + '<div class="settings-note" style="margin:-4px 0 0;">É a senha antiga do app (APP_SENHA no Apps Script). Só quem sabe o código consegue criar uma conta.</div>'
+        + (msg ? '<div style="font-size:12px;color:var(--red);">'+esc(msg)+'</div>' : '')
+        + '<div class="form-actions"><button type="submit" class="btn btn-primary">Criar conta e entrar</button></div>'
+        + '</form>';
+    }
+    html += '</div>';
+    document.getElementById('app').innerHTML = html;
   }
 
   function api(acao, extra){
-    var body = Object.assign({ acao:acao, senha:getSenha() }, extra || {});
+    var body = Object.assign({ acao:acao, token:getToken() }, extra || {});
     return fetch(CONFIG.API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body) })
       .then(function(r){ return r.json(); });
   }
 
   function handleApiError(res){
-    if(res.erro === 'senha'){ setSenha(''); renderLogin('Senha incorreta.'); return true; }
-    if(res.erro === 'bloqueado'){ renderLogin('Muitas tentativas erradas. Aguarde 15 minutos e tente de novo.'); return true; }
-    if(res.erro === 'sem_senha_configurada'){ renderLogin('A senha ainda não foi configurada no Apps Script (propriedade APP_SENHA).'); return true; }
-    if(res.erro === 'use_post'){ renderLogin('O Apps Script ainda está na versão antiga. Publique a nova versão (Implantar > Gerenciar implantações).'); return true; }
+    if(res.erro === 'sessao'){ setToken(''); baseSnapshot = null; renderLogin('Sua sessão terminou. Entre de novo.'); return true; }
+    if(res.erro === 'use_post'){ renderLogin(errMsg('use_post')); return true; }
     return false;
+  }
+
+  function afterLogin(res){
+    setToken(res.token); state.me = res.perfil; state.users = res.usuarios || [];
+    document.getElementById('app').innerHTML = '<div class="loading">Carregando seus dados...</div>';
+    loadState();
+  }
+
+  function renameTitular(antigo, novo){
+    if(!antigo || antigo === novo) return;
+    state.accounts.forEach(function(a){ if(a.titular === antigo) a.titular = novo; });
+    state.cards.forEach(function(c){ if(c.titular === antigo) c.titular = novo; });
+    if(state.titularColors[antigo] && !state.titularColors[novo]) state.titularColors[novo] = state.titularColors[antigo];
+    delete state.titularColors[antigo];
+    if(state.filterTitular === antigo) state.filterTitular = novo;
   }
 
   var dataVersion = 0;     // versao dos dados no servidor
   var baseSnapshot = null; // ultimo estado que sabemos estar salvo no servidor
-  var saving = false, saveAgain = false;
+  var saving = false, saveAgain = false, saveFailed = false;
+  function hasUnsaved(){ return !!saveTimer || saving || saveFailed; }
 
   function snapshot(){
     return JSON.parse(JSON.stringify({
@@ -708,11 +786,13 @@
         + 'Procure por <code>CONFIG.API_URL</code> perto do topo do script e cole ali a URL do seu Google Apps Script (termina em <code>/exec</code>).</div>';
       return Promise.resolve();
     }
-    if(!getSenha()){ renderLogin(); return Promise.resolve(); }
+    if(!getToken()){ renderLogin(); return Promise.resolve(); }
     if(!silent) setSaveStatus('Atualizando...');
     return api('ler').then(function(res){
       if(!res || res.ok !== true){ if(!handleApiError(res||{})) setSaveStatus('Erro ao carregar'); return; }
       dataVersion = res.versao || 0;
+      if(res.perfil) state.me = res.perfil;
+      if(res.usuarios) state.users = res.usuarios;
       baseSnapshot = JSON.parse(JSON.stringify(res.dados || {}));
       applySaved(res.dados || {});
       setSaveStatus('');
@@ -733,7 +813,7 @@
     return api('salvar', { versao: dataVersion, dados: toSave }).then(function(res){
       saving = false;
       if(res && res.ok){
-        dataVersion = res.versao; baseSnapshot = toSave;
+        dataVersion = res.versao; baseSnapshot = toSave; saveFailed = false;
         setSaveStatus('Salvo');
       }else if(res && res.erro === 'conflito' && tries < 3){
         // outro aparelho salvou antes: junta as duas versoes e tenta de novo
@@ -742,12 +822,13 @@
         applySaved(merged); render();
         setSaveStatus('Juntando com alterações do outro aparelho...');
         return doSave(tries + 1);
-      }else if(!handleApiError(res||{})){
-        setSaveStatus('Erro ao salvar - tente de novo');
+      }else{
+        saveFailed = true;
+        if(!handleApiError(res||{})) setSaveStatus('Erro ao salvar - toque em Atualizar agora');
       }
     }).catch(function(err){
-      saving = false;
-      setSaveStatus('Erro ao salvar - sem conexão?'); console.error(err);
+      saving = false; saveFailed = true;
+      setSaveStatus('Erro ao salvar - sem conexão? Toque em Atualizar agora'); console.error(err);
     }).then(function(){
       if(saveAgain){ saveAgain = false; return doSave(); }
     });
@@ -760,13 +841,27 @@
   }
 
   function refreshNow(silent){
-    if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; return doSave().then(function(){ return loadState(silent); }); }
     if(saving) return Promise.resolve();
+    if(saveTimer || saveFailed){
+      // primeiro tenta salvar o que esta pendente; so recarrega se deu certo (senao perderia as alteracoes)
+      clearTimeout(saveTimer); saveTimer = null;
+      return doSave().then(function(){ if(!saveFailed) return loadState(silent); });
+    }
     return loadState(silent);
   }
-  // ao voltar para o app, busca o que o outro aparelho mudou
   document.addEventListener('visibilitychange', function(){
-    if(document.visibilityState === 'visible' && getSenha() && baseSnapshot) refreshNow(true);
+    if(!getToken() || !baseSnapshot) return;
+    if(document.visibilityState === 'hidden'){
+      // saindo do app: salva na hora o que estiver pendente
+      if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; doSave(); }
+    }else if(!state.modal){
+      // voltando para o app: busca o que o outro aparelho mudou
+      refreshNow(true);
+    }
+  });
+  // aviso ao fechar/recarregar a pagina com alteracao ainda nao salva
+  window.addEventListener('beforeunload', function(e){
+    if(hasUnsaved()){ e.preventDefault(); e.returnValue = ''; return ''; }
   });
   function update(mutator){ mutator(); persist(); render(); }
 
@@ -777,7 +872,7 @@
     var openCls = state.navOpen ? ' open' : '';
     return '<div class="nav-backdrop'+openCls+'" data-action="close-nav"></div>'
       + '<div class="nav-panel'+openCls+'">'
-      + '<div class="nav-panel-title">JETRO</div>'
+      + '<div class="nav-panel-title">JETRO'+(state.me?'<div style="font-family:var(--font-body);font-weight:400;font-size:12px;color:var(--text-dim);letter-spacing:0;margin-top:4px;">'+esc(state.me.nome)+' (@'+esc(state.me.usuario)+')</div>':'')+'</div>'
       + NAV_TABS.map(function(t){ return '<button type="button" class="nav-item '+(state.tab===t[0]?'active':'')+'" data-action="go-tab" data-tab="'+t[0]+'">'+t[1]+'</button>'; }).join('')
       + '</div>';
   }
@@ -788,9 +883,14 @@
   }
 
   function headerHTML(){
-    return '<div class="app-header">'
+    var tempBanner = (state.me && state.me.senhaTemporaria)
+      ? '<div class="card" style="border-color:var(--amber);background:var(--amber-dim);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px;">'
+        + '<span style="font-size:13px;color:var(--amber);">Você entrou com uma <b>senha temporária</b>. Crie uma senha nova agora.</span>'
+        + (state.tab==='settings' ? '' : '<button type="button" class="btn btn-small" data-action="go-tab" data-tab="settings">Trocar senha</button>') + '</div>'
+      : '';
+    return tempBanner + '<div class="app-header">'
       + '<div class="app-title-row"><button type="button" class="hamburger-btn" data-action="toggle-nav">&#9776;</button>'
-      + '<p class="app-title">JETRO <span class="header-actions">'+ownerFilterHTML()+'<span class="save-status" id="save-status">'+esc(state.saveStatus)+'</span>'
+      + '<p class="app-title">JETRO <span class="header-actions">'+ownerFilterHTML()+'<span class="save-status" id="save-status" style="'+(/^Erro/.test(state.saveStatus)?'color:var(--red);':'')+'">'+esc(state.saveStatus)+'</span>'
       + '<button type="button" class="icon-btn" data-action="refresh-now">Atualizar agora</button></span></p></div>'
       + '</div>';
   }
@@ -915,7 +1015,8 @@
     var editingT = isEditing ? state.transactions.filter(function(t){return t.id===state.editing.id;})[0] : null;
     var descHint = !isEditing ? findAutocompleteMatch(d.desc) : null;
 
-    var html = '<div class="section-title">'+(isEditing?'Editar lançamento':'Novo lançamento')+'</div>';
+    var formTitle = (isEditing?'Editar lançamento':'Novo lançamento');
+    var html = '';
     html += '<form class="inline-form" data-form="transaction">'
       + '<input type="hidden" name="id" value="'+(isEditing?state.editing.id:'')+'">'
       + '<div class="form-row">'
@@ -949,13 +1050,14 @@
     html += '</div>';
 
     html += '<div class="form-actions">'
-      + (isEditing ? '<button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>' : '')
+      + '<button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>'
       + '<button type="submit" class="btn btn-primary">'+(isEditing?'Salvar alterações':'Adicionar lançamento')+'</button>'
       + '</div></form>';
+    var formHtml = html; html = '';
 
     var tf = state.txFilter;
     var tfCats = categoryListForTipo(tf.tipo);
-    html += '<div class="section-title">Histórico</div>';
+    html += '<div class="section-title">Lançamentos'+addButtonHTML('transaction','Novo lançamento')+'</div>';
     html += '<div class="form-row" style="margin-bottom:10px;">'
       + '<div><label>Mês</label><div class="month-picker"><button type="button" data-action="tx-month-prev">&lt;</button><span class="label">'+(state.txMonth==='todos'?'Todos os meses':monthLabel(state.txMonth))+'</span><button type="button" data-action="tx-month-next">&gt;</button></div></div>'
       + '<div><label>&nbsp;</label><button type="button" class="btn btn-ghost btn-small" data-action="tx-month-all">Ver todos os meses</button></div>'
@@ -1005,14 +1107,14 @@
         var sign = t.tipo==='entrada' ? '+' : '-';
         var groupBtn = t.installmentGroupId ? ('<button type="button" class="icon-btn '+(confirmingGroup?'confirm':'danger')+'" data-action="delete-transaction-group" data-id="'+t.id+'">'+(confirmingGroup?'Confirmar':'Excluir esta e as seguintes')+'</button>') : '';
         return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(t.desc)+parcelaTxt+billTag+'</div>'
-          + '<div class="li-sub">'+fmtDate(t.date)+' - '+esc(t.category)+' - '+esc(t.forma)+' - '+esc(place)+'</div></div>'
+          + '<div class="li-sub">'+fmtDate(t.date)+' - '+esc(t.category)+' - '+esc(t.forma)+' - '+esc(place)+(t.criadoPor?' - por '+esc(nomeDe(t.criadoPor)):'')+'</div></div>'
           + '<div class="li-value '+t.tipo+'">'+sign+fmtBRL(t.value)+'</div>'
           + '<div class="li-actions">'+(isInvoicePayment(t) ? '' : '<button type="button" class="icon-btn" data-action="edit-transaction" data-id="'+t.id+'">Editar</button>')
           + '<button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-transaction" data-id="'+t.id+'">'+(confirming?'Confirmar':'Excluir')+'</button>'
           + groupBtn + '</div></div>';
       }).join('') + '</div>';
     }
-    return html;
+    return html + modalHTML('transaction', formTitle, formHtml);
   }
 
   function cycleSelectHTML(){
@@ -1054,7 +1156,8 @@
   function renderAccounts(){
     var editingA = state.editing.type==='account' ? state.accounts.filter(function(a){return a.id===state.editing.id;})[0] : null;
     var titularOpts = allTitulares().map(function(t){return '<option value="'+esc(t)+'">';}).join('');
-    var html = '<div class="section-title">'+(editingA?'Editar conta':'Nova conta')+'</div>';
+    var formTitle = (editingA?'Editar conta':'Nova conta');
+    var html = '';
     html += '<form class="inline-form" data-form="account">'
       + '<input type="hidden" name="id" value="'+(editingA?editingA.id:'')+'">'
       + '<div class="form-row">'
@@ -1063,9 +1166,10 @@
       + '<div><label>Saldo inicial (R$)</label><input type="number" step="0.01" name="saldoInicial" value="'+(editingA?editingA.saldoInicial:'0')+'"></div>'
       + '</div>'
       + '<div class="checkbox-row"><input type="checkbox" id="isInvestment" name="isInvestment" '+(editingA&&editingA.isInvestment?'checked':'')+'><label for="isInvestment">Esta conta é um investimento (não soma no saldo total)</label></div>'
-      + '<div class="form-actions">'+(editingA?'<button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>':'')+'<button type="submit" class="btn btn-primary">'+(editingA?'Salvar alterações':'Adicionar conta')+'</button></div></form>';
+      + '<div class="form-actions"><button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>'+'<button type="submit" class="btn btn-primary">'+(editingA?'Salvar alterações':'Adicionar conta')+'</button></div></form>';
+    var formHtml = html; html = '';
 
-    html += '<div class="section-title">Suas contas</div>';
+    html += '<div class="section-title">Suas contas'+addButtonHTML('account','Nova conta')+'</div>';
     var accs = state.accounts.filter(function(a){ return passesOwnerFilter(a.titular); });
     if(accs.length===0){
       html += '<div class="empty">Nenhuma conta '+(state.filterTitular?'de '+esc(state.filterTitular)+' ':'')+'cadastrada ainda.</div>';
@@ -1081,14 +1185,15 @@
           + '<button type="button" class="icon-btn '+(confirming?'confirm':'danger')+'" data-action="delete-account" data-id="'+a.id+'">'+(confirming?'Confirmar':'Excluir')+'</button></div></div>';
       }).join('') + '</div>';
     }
-    return html;
+    return html + modalHTML('account', formTitle, formHtml);
   }
 
   // ---------- cards ----------
   function renderCards(){
     var editingC = state.editing.type==='card' ? state.cards.filter(function(c){return c.id===state.editing.id;})[0] : null;
     var titularOpts = allTitulares().map(function(t){return '<option value="'+esc(t)+'">';}).join('');
-    var html = '<div class="section-title">'+(editingC?'Editar cartão':'Novo cartão')+'</div>';
+    var formTitle = (editingC?'Editar cartão':'Novo cartão');
+    var html = '';
     html += '<form class="inline-form" data-form="card">'
       + '<input type="hidden" name="id" value="'+(editingC?editingC.id:'')+'">'
       + '<div class="form-row">'
@@ -1101,9 +1206,10 @@
       + '<div><label>Limite total (R$)</label><input type="number" step="0.01" name="limit" value="'+(editingC?editingC.limit:'0')+'"></div>'
       + '</div>'
       + '<div class="settings-note">Se o dia de fechamento ou de vencimento cair em fim de semana ou feriado nacional, o app empurra automaticamente para o próximo dia útil.</div>'
-      + '<div class="form-actions">'+(editingC?'<button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>':'')+'<button type="submit" class="btn btn-primary">'+(editingC?'Salvar alterações':'Adicionar cartão')+'</button></div></form>';
+      + '<div class="form-actions"><button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>'+'<button type="submit" class="btn btn-primary">'+(editingC?'Salvar alterações':'Adicionar cartão')+'</button></div></form>';
+    var formHtml = html; html = '';
 
-    html += '<div class="section-title">Seus cartões</div>';
+    html += '<div class="section-title">Seus cartões'+addButtonHTML('card','Novo cartão')+'</div>';
     var crds = state.cards.filter(function(c){ return passesOwnerFilter(c.titular); });
     if(crds.length===0){
       html += '<div class="empty">Nenhum cartão '+(state.filterTitular?'de '+esc(state.filterTitular)+' ':'')+'cadastrado ainda.</div>';
@@ -1157,7 +1263,7 @@
         return block;
       }).join('');
     }
-    return html;
+    return html + modalHTML('card', formTitle, formHtml);
   }
 
   // ---------- fixed bills ----------
@@ -1168,7 +1274,8 @@
     var formaSel = d.forma;
     var isReceita = d.natureza === 'receita';
 
-    var html = '<div class="section-title">'+(isEditing?'Editar conta fixa':'Nova conta fixa')+'</div>';
+    var formTitle = (isEditing?'Editar conta fixa':'Nova conta fixa');
+    var html = '';
     html += '<form class="inline-form" data-form="bill">'
       + '<input type="hidden" name="id" value="'+(isEditing?state.editing.id:'')+'">'
       + '<div class="form-row">'
@@ -1192,14 +1299,15 @@
               ? '<div><label>Cartão</label><select name="cardId">'+(state.cards.length?state.cards.map(function(c){return '<option value="'+c.id+'" '+(d.cardId===c.id?'selected':'')+'>'+esc(c.name)+'</option>';}).join(''):'<option value="">Cadastre um cartão primeiro</option>')+'</select></div>'
               : '<div><label>Conta padrão</label><select name="accountId">'+ (state.accounts.length?('<option value="">Escolher na hora de lançar</option>'+state.accounts.map(function(a){return '<option value="'+a.id+'" '+(d.accountId===a.id?'selected':'')+'>'+esc(a.name)+'</option>';}).join('')):'<option value="">Cadastre uma conta primeiro</option>')+'</select></div>'))
       + '</div>'
-      + '<div class="form-actions">'+(isEditing?'<button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>':'')+'<button type="submit" class="btn btn-primary">'+(isEditing?'Salvar alterações':'Adicionar conta fixa')+'</button></div></form>';
+      + '<div class="form-actions"><button type="button" class="btn btn-ghost" data-action="cancel-edit">Cancelar</button>'+'<button type="submit" class="btn btn-primary">'+(isEditing?'Salvar alterações':'Adicionar conta fixa')+'</button></div></form>';
+    var formHtml = html; html = '';
 
     var bm = state.billsMonth;
     var isCurMonth = bm === currentMonthKey();
     html += '<div class="section-title">Contas fixas do mês'
-      + '<div class="month-picker"><button type="button" data-action="bills-month-prev">&lt;</button><span class="label">'+monthLabel(bm)+'</span><button type="button" data-action="bills-month-next">&gt;</button>'
+      + '<div class="title-actions"><div class="month-picker"><button type="button" data-action="bills-month-prev">&lt;</button><span class="label">'+monthLabel(bm)+'</span><button type="button" data-action="bills-month-next">&gt;</button>'
       + (isCurMonth ? '' : '<button type="button" data-action="bills-month-today" style="width:auto;padding:0 10px;font-size:12px;">Mês atual</button>')
-      + '</div></div>';
+      + '</div>'+addButtonHTML('bill','Nova conta fixa')+'</div></div>';
     var monthBills = billsForMonth(bm);
     if(monthBills.length===0){
       html += '<div class="empty">Nenhuma conta fixa em '+monthLabel(bm)+'.</div>';
@@ -1273,7 +1381,7 @@
         return row;
       }).join('') + '</div>';
     }
-    return html;
+    return html + modalHTML('bill', formTitle, formHtml);
   }
 
   // ---------- report ----------
@@ -1401,8 +1509,64 @@
   }
 
   // ---------- settings ----------
+  function accountSettingsHTML(){
+    if(!state.me) return '';
+    var me = state.me;
+    var html = '<div class="section-title">Minha conta</div>';
+    html += '<form class="inline-form" data-form="profile">'
+      + '<div class="form-row">'
+      + '<div><label>Nome</label><input type="text" name="nome" required maxlength="40" value="'+esc(me.nome)+'"></div>'
+      + '<div><label>Usuário</label><input type="text" name="usuario" required autocapitalize="none" spellcheck="false" value="'+esc(me.usuario)+'"></div>'
+      + '<div><label>Minha cor</label><input type="color" name="cor" value="'+esc(state.titularColors[me.nome]||'#60A5FA')+'"></div>'
+      + '</div>'
+      + '<div class="settings-note" style="margin:0;">Mudar o nome também troca o titular das suas contas e cartões.</div>'
+      + (state.profileMsg ? '<div style="font-size:12px;color:'+(/^Erro|incorret|já existe|precisa|Preencha|Usuário:/.test(state.profileMsg)?'var(--red)':'var(--green)')+';">'+esc(state.profileMsg)+'</div>' : '')
+      + '<div class="form-actions"><button type="submit" class="btn btn-primary btn-small">Salvar</button></div></form>';
+    html += '<form class="inline-form" data-form="password">'
+      + '<div class="form-row">'
+      + '<div><label>Senha atual</label><input type="password" name="senhaAtual" required autocomplete="current-password"></div>'
+      + '<div><label>Nova senha</label><input type="password" name="novaSenha" required minlength="6" autocomplete="new-password"></div>'
+      + '<div><label>Repita a nova senha</label><input type="password" name="novaSenha2" required minlength="6" autocomplete="new-password"></div>'
+      + '</div>'
+      + (state.passwordMsg ? '<div style="font-size:12px;color:'+(/^Senha alterada/.test(state.passwordMsg)?'var(--green)':'var(--red)')+';">'+esc(state.passwordMsg)+'</div>' : '')
+      + '<div class="form-actions"><button type="submit" class="btn btn-primary btn-small">Trocar senha</button></div></form>';
+    html += '<div class="section-title">Pessoas com acesso</div><div class="list">' + (state.users||[]).map(function(u){
+      var isMe = u.usuario === me.usuario;
+      return '<div class="list-item" style="border-left-color:'+ownerColor(u.nome)+'"><div class="li-main"><div class="li-title"><span class="owner-dot" style="background:'+ownerColor(u.nome)+'"></span> '+esc(u.nome)+(isMe?' <span class="tag">você</span>':'')+'</div><div class="li-sub">@'+esc(u.usuario)+'</div></div>'
+        + (isMe ? '' : '<div class="li-actions"><button type="button" class="icon-btn" data-action="open-reset-user" data-id="'+esc(u.usuario)+'">Redefinir senha</button><button type="button" class="icon-btn danger" data-action="open-remove-user" data-id="'+esc(u.usuario)+'">Remover acesso</button></div>') + '</div>';
+    }).join('') + '</div>';
+    html += '<div class="settings-note" style="margin-top:8px;">Para dar acesso a outra pessoa: ela abre o app, toca em <b>Criar conta</b> e usa o código da família.</div>';
+    html += '<div class="section-title" style="font-size:14px;">Código da família</div>'
+      + '<form class="inline-form" data-form="family-code">'
+      + '<div class="settings-note" style="margin:0;">É o código pedido para criar uma conta nova. Trocar o código não afeta quem já tem conta.</div>'
+      + '<div class="form-row">'
+      + '<div><label>Novo código</label><input type="password" name="novoCodigo" required minlength="6" autocomplete="new-password"></div>'
+      + '<div><label>Repita o novo código</label><input type="password" name="novoCodigo2" required minlength="6" autocomplete="new-password"></div>'
+      + '<div><label>Sua senha (para confirmar)</label><input type="password" name="senha" required autocomplete="current-password"></div>'
+      + '</div>'
+      + (state.codeMsg ? '<div style="font-size:12px;color:'+(/^Código alterado/.test(state.codeMsg)?'var(--green)':'var(--red)')+';">'+esc(state.codeMsg)+'</div>' : '')
+      + '<div class="form-actions"><button type="submit" class="btn btn-primary btn-small">Trocar código</button></div></form>';
+    html += modalHTML('reset-user', 'Redefinir senha de '+(state.removeUser?nomeDe(state.removeUser):''),
+      state.tempPass
+        ? '<div style="font-size:14px;line-height:1.5;">Senha temporária de <b>'+esc(nomeDe(state.removeUser))+'</b> (@'+esc(state.removeUser)+'):</div>'
+          + '<div style="font-family:var(--font-mono);font-size:26px;font-weight:600;text-align:center;padding:16px;margin:12px 0;background:var(--panel);border:1px solid var(--border);border-radius:10px;user-select:all;">'+esc(state.tempPass)+'</div>'
+          + '<div class="settings-note" style="margin:0 0 8px;">Passe essa senha para a pessoa. Ao entrar, o app vai pedir para ela trocar por uma nova. Os aparelhos dela foram desconectados. Esta senha não aparece de novo depois que você fechar.</div>'
+          + '<div class="form-actions"><button type="button" class="btn btn-ghost" data-action="copy-temp-pass">Copiar</button><button type="button" class="btn btn-primary" data-action="close-modal">Fechar</button></div>'
+        : '<div style="font-size:14px;line-height:1.5;margin-bottom:12px;">O app vai criar uma <b>senha temporária</b> para <b>'+esc(state.removeUser?nomeDe(state.removeUser):'')+'</b>. A senha antiga deixa de funcionar e os aparelhos dessa pessoa são desconectados.</div>'
+          + '<label for="reset-user-pass">Confirme com a SUA senha</label><input type="password" id="reset-user-pass" autocomplete="current-password">'
+          + '<div id="modal-msg" style="font-size:12px;color:var(--red);margin-top:8px;min-height:16px;"></div>'
+          + '<div class="form-actions" style="margin-top:8px;"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="button" class="btn btn-primary" data-action="reset-user-confirm">Gerar senha temporária</button></div>');
+    html += modalHTML('remove-user', 'Remover acesso?',
+      '<div style="font-size:14px;line-height:1.5;margin-bottom:12px;"><b>'+esc(state.removeUser?nomeDe(state.removeUser):'')+'</b> não vai mais conseguir entrar, e os aparelhos dessa pessoa são desconectados na hora. Os dados financeiros não são apagados.</div>'
+      + '<label for="remove-user-pass">Confirme com a SUA senha</label><input type="password" id="remove-user-pass" autocomplete="current-password">'
+      + '<div id="modal-msg" style="font-size:12px;color:var(--red);margin-top:8px;min-height:16px;"></div>'
+      + '<div class="form-actions" style="margin-top:8px;"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="button" class="btn btn-danger" data-action="remove-user-confirm">Remover</button></div>');
+    return html;
+  }
+
   function renderSettings(){
     var html = '<div class="section-title">Categorias de gasto<button type="button" class="icon-btn" data-action="toggle-categories-open">'+(state.categoriesOpen?'Recolher':'('+state.categories.length+') Ver / editar')+'</button></div>';
+    html = accountSettingsHTML() + html;
     if(state.categoriesOpen){
       html += '<form class="inline-form" data-form="add-category"><div class="form-row"><div><label>Nova categoria</label><input type="text" name="name" placeholder="Ex: Pet shop" required></div></div><div class="form-actions"><button type="submit" class="btn btn-primary btn-small">Adicionar categoria</button></div></form>';
       html += '<div class="list">' + state.categories.map(function(cat){
@@ -1436,7 +1600,7 @@
       }).join('') + '</div>';
     }
 
-    html += '<div class="section-title">Cor de cada usuário</div>';
+    html += '<div class="section-title">Cor de cada titular</div>';
     html += '<div class="list">' + allTitulares().map(function(t){
       return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(t)+'</div></div>'
         + '<input type="color" data-action="titular-color-change" data-titular="'+esc(t)+'" value="'+(state.titularColors[t]||'#60A5FA')+'" style="width:50px;"></div>';
@@ -1446,20 +1610,62 @@
     return html;
   }
 
-  function settingsHTML(){
-    var confirming = state.confirmingDeleteKey === 'reset-all';
-    return '<div class="settings-block">'
-      + '<div class="settings-note">Os dados ficam salvos na sua planilha do Google Sheets e só são lidos/gravados com a senha. Se você usar o app em outro aparelho, a senha é pedida uma vez nele.</div>'
-      + '<button type="button" class="btn btn-ghost" data-action="logout" style="margin-right:8px;">Sair deste aparelho</button>'
-      + '<button type="button" class="btn btn-ghost" data-action="reset-all" style="'+(confirming?'color:var(--red);border-color:var(--red);':'')+'">'+(confirming?'Clique novamente para apagar tudo':'Apagar todos os dados')+'</button>'
-      + '</div>';
+  function fmtBackupId(id){ var m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(id||''); return m ? m[3]+'/'+m[2]+'/'+m[1]+' às '+m[4]+':'+m[5] : id; }
+
+  function backupsHTML(){
+    var html = '<div class="section-title">Backups<button type="button" class="icon-btn" data-action="load-backups">'+(Array.isArray(state.backups)?'Atualizar lista':'Ver backups')+'</button></div>'
+      + '<div class="settings-note">Todo dia, no primeiro salvamento, o app guarda uma cópia de como os dados estavam. Também guarda uma cópia antes de "Apagar todos os dados" e antes de restaurar. Ficam os últimos 40 (aba "Backup" da planilha).</div>';
+    if(state.backups === 'loading') html += '<div class="empty">Carregando...</div>';
+    else if(state.backups && state.backups.erro) html += '<div class="empty">'+esc(state.backups.erro)+'</div>';
+    else if(Array.isArray(state.backups)){
+      if(!state.backups.length) html += '<div class="empty">Nenhum backup ainda. O primeiro é feito no próximo salvamento.</div>';
+      else html += '<div class="list">' + state.backups.map(function(bk){
+        return '<div class="list-item"><div class="li-main"><div class="li-title">'+esc(fmtBackupId(bk.id))+' <span class="tag">'+esc(bk.motivo)+'</span></div><div class="li-sub">'+(bk.quem?'por '+esc(bk.quem)+' - ':'')+esc(bk.resumo)+'</div></div>'
+          + '<div class="li-actions"><button type="button" class="icon-btn" data-action="open-restore" data-id="'+esc(bk.id)+'">Restaurar</button></div></div>';
+      }).join('') + '</div>';
+    }
+    return html;
   }
+
+  function settingsHTML(){
+    var html = backupsHTML();
+    html += '<div class="settings-block">'
+      + '<div class="settings-note">Os dados ficam salvos na sua planilha do Google Sheets e só são lidos/gravados por quem tem conta. Cada aparelho fica conectado por até 180 dias.</div>'
+      + '<button type="button" class="btn btn-ghost" data-action="logout" style="margin-right:8px;">Sair deste aparelho</button>'
+      + '<button type="button" class="btn btn-ghost" data-action="open-modal" data-modal="reset" style="color:var(--red);border-color:var(--red-dim);">Apagar todos os dados</button>'
+      + '</div>';
+    html += modalHTML('reset', 'Apagar todos os dados?',
+      '<div style="font-size:14px;line-height:1.5;margin-bottom:12px;">Isso apaga <b>todas as contas, cartões, lançamentos e contas fixas</b> dos dois aparelhos. Antes de apagar, o app guarda um backup (dá para voltar em Ajustes &gt; Backups).</div>'
+      + '<label for="reset-confirm-input">Para confirmar, digite APAGAR</label>'
+      + '<input type="text" id="reset-confirm-input" autocomplete="off" placeholder="APAGAR">'
+      + '<div id="modal-msg" style="font-size:12px;color:var(--amber);margin-top:8px;min-height:16px;"></div>'
+      + '<div class="form-actions" style="margin-top:8px;"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="button" class="btn btn-danger" data-action="reset-confirm" disabled>Apagar tudo</button></div>');
+    var rb = Array.isArray(state.backups) ? state.backups.filter(function(x){ return x.id===state.restoreId; })[0] : null;
+    html += modalHTML('restore', 'Restaurar backup?',
+      '<div style="font-size:14px;line-height:1.5;margin-bottom:12px;">Os dados vão voltar a ficar como estavam em <b>'+esc(fmtBackupId(state.restoreId))+'</b>'+(rb?' ('+esc(rb.resumo)+')':'')+'. Tudo o que foi feito depois disso some dos dois aparelhos.<br><br>Antes de restaurar, o app guarda uma cópia dos dados de agora, então dá para desfazer.</div>'
+      + '<div id="modal-msg" style="font-size:12px;color:var(--amber);min-height:16px;"></div>'
+      + '<div class="form-actions" style="margin-top:8px;"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="button" class="btn btn-primary" data-action="restore-confirm">Restaurar</button></div>');
+    return html;
+  }
+
+  function modalHTML(type, title, body){
+    if(state.modal !== type) return '';
+    return '<div class="modal-backdrop" data-action="close-modal"><div class="modal-box" data-action="modal-noop" role="dialog" aria-modal="true">'
+      + '<div class="modal-head"><span>'+esc(title)+'</span><button type="button" class="modal-close" data-action="close-modal" aria-label="Fechar">&times;</button></div>'
+      + body + '</div></div>';
+  }
+  function addButtonHTML(type, label){ return '<button type="button" class="btn btn-primary btn-small" data-action="open-modal" data-modal="'+type+'">+ '+label+'</button>'; }
 
   var sectionRenderers = { overview:renderOverview, vencimentos:renderVencimentos, transactions:renderTransactions, accounts:renderAccounts, cards:renderCards, bills:renderBills, report:renderReport, settings:renderSettings };
 
   function render(){
     var root = document.getElementById('app');
+    var oldModal = document.querySelector('.modal-backdrop');
+    var modalScroll = oldModal ? oldModal.scrollTop : 0;
     root.innerHTML = sidebarHTML() + headerHTML() + '<main>' + sectionRenderers[state.tab]() + '</main>';
+    var newModal = document.querySelector('.modal-backdrop');
+    if(newModal) newModal.scrollTop = modalScroll;
+    document.body.style.overflow = state.modal ? 'hidden' : '';
     drawCharts();
   }
 
@@ -1493,7 +1699,7 @@
     var btn = e.target.closest('[data-action]');
     if(!btn) return;
     var action = btn.dataset.action;
-    var isDeleteAction = action.indexOf('delete-') === 0 || action === 'reset-all';
+    var isDeleteAction = action.indexOf('delete-') === 0;
 
     if(action==='toggle-categories-open'){ state.categoriesOpen = !state.categoriesOpen; render(); return; }
     if(action==='toggle-income-categories-open'){ state.incomeCategoriesOpen = !state.incomeCategoriesOpen; render(); return; }
@@ -1501,11 +1707,24 @@
     if(action==='toggle-nav'){ state.navOpen = !state.navOpen; render(); return; }
     if(action==='close-nav'){ state.navOpen = false; render(); return; }
     if(action==='go-tab'){
-      state.tab=btn.dataset.tab; state.navOpen=false; state.editing={type:null,id:null,transferId:null};
+      state.tab=btn.dataset.tab; state.navOpen=false; state.profileMsg=''; state.passwordMsg=''; state.codeMsg=''; state.editing={type:null,id:null,transferId:null}; state.modal=null;
       state.confirmingDeleteKey=null; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft();
       state.payingCycle=null; state.launchingBillId=null; state.openBillMenu=null; render(); return;
     }
-    if(action==='cancel-edit'){ state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft(); state.openBillMenu=null; render(); return; }
+    if(action==='modal-noop') return;
+    if(action==='login-mode'){ renderLogin('', btn.dataset.mode); return; }
+    if(action==='cancel-edit' || action==='close-modal'){ closeModal(); return; }
+    if(action==='open-modal'){
+      var mt = btn.dataset.modal;
+      if(state.editing.type){ state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft(); }
+      state.modal = mt; state.confirmingDeleteKey = null; render();
+      if(mt==='reset'){ var ri = document.getElementById('reset-confirm-input'); if(ri) ri.focus(); }
+      return;
+    }
+    if(action==='reset-confirm'){ doResetAll(); return; }
+    if(action==='load-backups'){ loadBackups(); return; }
+    if(action==='open-restore'){ state.restoreId = btn.dataset.id; state.modal = 'restore'; render(); return; }
+    if(action==='restore-confirm'){ doRestore(); return; }
     if(action==='toggle-bill-menu'){ state.openBillMenu = (state.openBillMenu===btn.dataset.id) ? null : btn.dataset.id; render(); return; }
     if(action==='venc-month-prev' || action==='venc-month-next'){
       var baseV = state.vencimentosMonth==='todos' ? currentMonthKey() : state.vencimentosMonth;
@@ -1551,7 +1770,8 @@
         state.editing = { type:type, id: btn.dataset.id, transferId:null };
       }
       state.confirmingDeleteKey=null;
-      render(); window.scrollTo({top:0,behavior:'smooth'});
+      state.modal = (type==='transaction'||type==='account'||type==='card'||type==='bill') ? type : null;
+      render();
       return;
     }
     if(action==='start-pay'){ state.payingCycle = btn.dataset.cardId+':'+btn.dataset.cycle; render(); return; }
@@ -1559,7 +1779,34 @@
     if(action==='start-launch'){ state.launchingBillId = btn.dataset.id; render(); return; }
     if(action==='cancel-launch'){ state.launchingBillId = null; render(); return; }
     if(action==='refresh-now'){ refreshNow(); return; }
-    if(action==='logout'){ setSenha(''); baseSnapshot = null; renderLogin(); return; }
+    if(action==='logout'){ api('sair').catch(function(){}); setToken(''); baseSnapshot = null; state.me = null; renderLogin(); return; }
+    if(action==='open-remove-user'){ state.removeUser = btn.dataset.id; state.modal = 'remove-user'; render(); var rp = document.getElementById('remove-user-pass'); if(rp) rp.focus(); return; }
+    if(action==='open-reset-user'){ state.removeUser = btn.dataset.id; state.tempPass = null; state.modal = 'reset-user'; render(); var up = document.getElementById('reset-user-pass'); if(up) up.focus(); return; }
+    if(action==='reset-user-confirm'){
+      var upass = (document.getElementById('reset-user-pass')||{}).value || '';
+      if(!upass){ setModalMsg('Digite a sua senha.'); return; }
+      setModalMsg('Gerando...');
+      api('redefinirSenhaDe', { usuario: state.removeUser, senha: upass }).then(function(res){
+        if(res && res.ok){ state.tempPass = res.senhaTemporaria; render(); }
+        else if(!handleApiError(res||{})) setModalMsg(errMsg(res && res.erro));
+      }).catch(function(){ setModalMsg('Sem conexão.'); });
+      return;
+    }
+    if(action==='copy-temp-pass'){
+      var tp = state.tempPass || '';
+      try{ navigator.clipboard.writeText(tp).then(function(){ btn.textContent = 'Copiado!'; }, function(){ btn.textContent = 'Selecione e copie'; }); }catch(err){ btn.textContent = 'Selecione e copie'; }
+      return;
+    }
+    if(action==='remove-user-confirm'){
+      var rpass = (document.getElementById('remove-user-pass')||{}).value || '';
+      if(!rpass){ setModalMsg('Digite a sua senha.'); return; }
+      setModalMsg('Removendo...');
+      api('removerUsuario', { usuario: state.removeUser, senha: rpass }).then(function(res){
+        if(res && res.ok){ state.users = res.usuarios || state.users; state.modal = null; state.removeUser = null; render(); }
+        else if(!handleApiError(res||{})) setModalMsg(errMsg(res && res.erro));
+      }).catch(function(){ setModalMsg('Sem conexão.'); });
+      return;
+    }
     if(action==='tx-month-prev'){ state.txMonth = state.txMonth==='todos' ? shiftMonth(currentMonthKey(),-1) : shiftMonth(state.txMonth,-1); render(); return; }
     if(action==='tx-month-next'){ state.txMonth = state.txMonth==='todos' ? shiftMonth(currentMonthKey(),1) : shiftMonth(state.txMonth,1); render(); return; }
     if(action==='tx-month-all'){ state.txMonth = 'todos'; render(); return; }
@@ -1658,8 +1905,54 @@
     if(hint) hint.style.display = '';
   }
 
+  function closeModal(){
+    // se estava editando, descarta; se era um item novo, guarda o rascunho para nao perder o que foi digitado
+    if(state.editing.type){ state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft(); state.billDraft=freshBillDraft(); }
+    state.modal = null; state.openBillMenu = null; state.tempPass = null; render();
+  }
+  document.addEventListener('keydown', function(e){ if(e.key==='Escape' && state.modal) closeModal(); });
+
+  function setModalMsg(msg){ var el = document.getElementById('modal-msg'); if(el) el.textContent = msg; }
+
+  function doResetAll(){
+    var inp = document.getElementById('reset-confirm-input');
+    if(!inp || inp.value.trim().toUpperCase() !== 'APAGAR') return;
+    var b = document.querySelector('[data-action="reset-confirm"]'); if(b) b.disabled = true;
+    setModalMsg('Guardando um backup antes de apagar...');
+    api('backup', { motivo:'Antes de apagar tudo' }).then(function(res){
+      if(!res || !res.ok){ setModalMsg('Não consegui fazer o backup, então nada foi apagado.'); if(b) b.disabled = false; return; }
+      state.backups = null;
+      update(function(){ state.accounts=[]; state.cards=[]; state.transactions=[]; state.fixedBills=[]; state.modal=null; });
+    }).catch(function(){ setModalMsg('Sem conexão. Nada foi apagado.'); if(b) b.disabled = false; });
+  }
+
+  function loadBackups(){
+    state.backups = 'loading'; render();
+    api('backups').then(function(res){
+      if(res && res.ok){ state.backups = res.backups || []; render(); }
+      else if(!handleApiError(res||{})){ state.backups = { erro:'Não foi possível carregar os backups.' }; render(); }
+    }).catch(function(){ state.backups = { erro:'Sem conexão.' }; render(); });
+  }
+
+  function doRestore(){
+    var id = state.restoreId; if(!id) return;
+    var b = document.querySelector('[data-action="restore-confirm"]'); if(b) b.disabled = true;
+    setModalMsg('Restaurando...');
+    clearTimeout(saveTimer); saveTimer = null; // descarta alteracao pendente deste aparelho
+    api('restaurar', { id:id }).then(function(res){
+      if(!res || !res.ok){ setModalMsg('Não foi possível restaurar' + (res && res.erro ? ' ('+res.erro+')' : '') + '.'); if(b) b.disabled = false; return; }
+      state.modal = null; state.backups = null; saveFailed = false;
+      loadState().then(function(){ setSaveStatus('Backup restaurado'); });
+    }).catch(function(){ setModalMsg('Sem conexão.'); if(b) b.disabled = false; });
+  }
+
   document.addEventListener('input', function(e){
     var t = e.target;
+    if(t.id === 'reset-confirm-input'){
+      var rb = document.querySelector('[data-action="reset-confirm"]');
+      if(rb) rb.disabled = t.value.trim().toUpperCase() !== 'APAGAR';
+      return;
+    }
     if(!t.name) return;
     var txForm = t.closest('form[data-form="transaction"]');
     if(txForm){ state.txDraft[t.name] = t.value; if(t.name==='date'){ refreshCycleOptions(txForm); } if(t.name==='desc'){ applyAutocomplete(txForm); } return; }
@@ -1703,12 +1996,61 @@
     if(!form) return;
     e.preventDefault();
     var type = form.dataset.form;
-    if(type === 'login'){
-      var senhaDigitada = (new FormData(form).get('senha') || '').trim();
-      if(!senhaDigitada) return;
-      setSenha(senhaDigitada);
-      document.getElementById('app').innerHTML = '<div class="loading">Carregando seus dados...</div>';
-      loadState();
+    if(type === 'login' || type === 'signup'){
+      var lf = new FormData(form);
+      var sb = form.querySelector('button[type="submit"]'); if(sb){ sb.disabled = true; sb.textContent = 'Aguarde...'; }
+      var req;
+      if(type === 'login'){
+        req = api('login', { usuario:(lf.get('usuario')||'').trim(), senha:lf.get('senha')||'' });
+      }else{
+        if((lf.get('senha')||'') !== (lf.get('senha2')||'')){ renderLogin(errMsg('senhas_diferentes'), 'criar'); return; }
+        req = api('cadastrar', { nome:(lf.get('nome')||'').trim(), usuario:(lf.get('usuario')||'').trim(), senha:lf.get('senha')||'', codigo:lf.get('codigo')||'' });
+      }
+      req.then(function(res){
+        if(res && res.ok) return afterLogin(res);
+        var code = res && res.erro;
+        renderLogin(errMsg(code), (type==='signup' || code==='sem_usuarios') ? 'criar' : 'entrar');
+      }).catch(function(){ renderLogin('Sem conexão. Tente de novo.', type==='signup'?'criar':'entrar'); });
+      return;
+    }
+    if(type === 'profile'){
+      var pf = new FormData(form);
+      var pNome = (pf.get('nome')||'').trim(), pUser = (pf.get('usuario')||'').trim().toLowerCase().replace(/^@/,''), pCor = pf.get('cor');
+      var applyColor = function(nomeFinal){ update(function(){ state.titularColors[nomeFinal] = pCor; }); };
+      if(pNome === state.me.nome && pUser === state.me.usuario){ state.profileMsg = 'Salvo.'; applyColor(pNome); return; }
+      state.profileMsg = 'Salvando...'; render();
+      api('perfil', { nome:pNome, usuario:pUser }).then(function(res){
+        if(res && res.ok){
+          var antigo = res.nomeAntigo;
+          state.me = res.perfil; state.users = res.usuarios || state.users;
+          state.profileMsg = 'Salvo.';
+          update(function(){ renameTitular(antigo, state.me.nome); state.titularColors[state.me.nome] = pCor; });
+        }else if(!handleApiError(res||{})){ state.profileMsg = errMsg(res && res.erro); render(); }
+      }).catch(function(){ state.profileMsg = 'Erro: sem conexão.'; render(); });
+      return;
+    }
+    if(type === 'family-code'){
+      var cf = new FormData(form);
+      if((cf.get('novoCodigo')||'') !== (cf.get('novoCodigo2')||'')){ state.codeMsg = errMsg('codigos_diferentes'); render(); return; }
+      var cb = form.querySelector('button[type="submit"]'); if(cb){ cb.disabled = true; cb.textContent = 'Aguarde...'; }
+      api('codigo', { novoCodigo:cf.get('novoCodigo')||'', senha:cf.get('senha')||'' }).then(function(res){
+        if(res && res.ok) state.codeMsg = 'Código alterado. Passe o novo código só para quem for criar uma conta.';
+        else if(handleApiError(res||{})) return;
+        else state.codeMsg = errMsg(res && res.erro);
+        render();
+      }).catch(function(){ state.codeMsg = 'Erro: sem conexão.'; render(); });
+      return;
+    }
+    if(type === 'password'){
+      var wf = new FormData(form);
+      if((wf.get('novaSenha')||'') !== (wf.get('novaSenha2')||'')){ state.passwordMsg = errMsg('senhas_diferentes'); render(); return; }
+      state.passwordMsg = ''; var wb = form.querySelector('button[type="submit"]'); if(wb){ wb.disabled = true; wb.textContent = 'Aguarde...'; }
+      api('senha', { senhaAtual:wf.get('senhaAtual')||'', novaSenha:wf.get('novaSenha')||'' }).then(function(res){
+        if(res && res.ok){ state.passwordMsg = 'Senha alterada. Seus outros aparelhos foram desconectados e vão pedir a senha nova.'; if(state.me) state.me.senhaTemporaria = false; }
+        else if(handleApiError(res||{})) return;
+        else state.passwordMsg = errMsg(res && res.erro);
+        render();
+      }).catch(function(){ state.passwordMsg = 'Erro: sem conexão.'; render(); });
       return;
     }
     var fd = new FormData(form);
@@ -1722,7 +2064,7 @@
       update(function(){
         if(id){ var acc=state.accounts.filter(function(a){return a.id===id;})[0]; acc.name=name; acc.titular=titular; acc.saldoInicial=saldoInicial; acc.isInvestment=isInvestment; }
         else{ state.accounts.push({ id:uid(), name:name, titular:titular, saldoInicial:saldoInicial, isInvestment:isInvestment }); if(titular && !state.titularColors[titular]) state.titularColors[titular]=DEFAULT_COLORS[titular]||'#60A5FA'; }
-        state.editing={type:null,id:null,transferId:null};
+        state.editing={type:null,id:null,transferId:null}; state.modal=null;
       });
     }
 
@@ -1734,7 +2076,7 @@
       update(function(){
         if(id){ var c=state.cards.filter(function(x){return x.id===id;})[0]; c.name=cname; c.titular=ctitular; c.closingDay=closingDay; c.dueDay=dueDay; c.limit=limit; }
         else{ state.cards.push({ id:uid(), name:cname, titular:ctitular, closingDay:closingDay, dueDay:dueDay, limit:limit, paymentsByCycle:{} }); if(ctitular && !state.titularColors[ctitular]) state.titularColors[ctitular]=DEFAULT_COLORS[ctitular]||'#F472B6'; }
-        state.editing={type:null,id:null,transferId:null};
+        state.editing={type:null,id:null,transferId:null}; state.modal=null;
       });
     }
 
@@ -1758,7 +2100,7 @@
         }else{
           state.fixedBills.push({ id:uid(), name:bname, natureza:natureza, value:bvalue, dueDay:bDueDay, tipoRecorrencia:tipoRecorrencia, totalParcelas:totalParcelas, forma:forma, cardId:cardId, accountId:accountId, startMonth:startMonth, manuallyPaidMonths:[] });
         }
-        state.editing={type:null,id:null,transferId:null}; state.billDraft=freshBillDraft();
+        state.editing={type:null,id:null,transferId:null}; state.modal=null; state.billDraft=freshBillDraft();
       });
     }
 
@@ -1769,7 +2111,7 @@
       var amount = parseFloat(fd.get('amount'));
       if(!card || !accountId2 || !amount) return;
       update(function(){
-        state.transactions.push({ id:uid(), value:amount, date:todayISO(), desc:card.name+' - Pagamento de fatura ('+monthLabel(ck)+')', category:'Fatura de cartão', forma:PAGAMENTO_FATURA_FORMA, tipo:'saida', accountId:accountId2, cardId:null, invoiceCycleKey:null, installment:null, paidCardId:card.id, paidCycleKey:ck });
+        state.transactions.push({ criadoPor:meUser(), id:uid(), value:amount, date:todayISO(), desc:card.name+' - Pagamento de fatura ('+monthLabel(ck)+')', category:'Fatura de cartão', forma:PAGAMENTO_FATURA_FORMA, tipo:'saida', accountId:accountId2, cardId:null, invoiceCycleKey:null, installment:null, paidCardId:card.id, paidCycleKey:ck });
         card.paymentsByCycle = card.paymentsByCycle || {};
         card.paymentsByCycle[ck] = (card.paymentsByCycle[ck]||0) + amount;
         state.payingCycle = null;
@@ -1786,7 +2128,7 @@
       var billMonth = form.dataset.month || ldate.slice(0,7);
       update(function(){
         var tipo = bill.natureza==='receita' ? 'entrada' : 'saida';
-        var tx = { id:uid(), value:lvalue, date:ldate, desc:bill.name, category: bill.natureza==='receita'?'Receita fixa':'Contas fixas', forma: bill.forma==='cartao'?'Cartão de Crédito':(bill.forma==='boleto'?'Boleto':'Débito automático'), tipo:tipo, accountId:null, cardId:null, invoiceCycleKey:null, installment:null, billId:bill.id, billMonth:billMonth };
+        var tx = { criadoPor:meUser(), id:uid(), value:lvalue, date:ldate, desc:bill.name, category: bill.natureza==='receita'?'Receita fixa':'Contas fixas', forma: bill.forma==='cartao'?'Cartão de Crédito':(bill.forma==='boleto'?'Boleto':'Débito automático'), tipo:tipo, accountId:null, cardId:null, invoiceCycleKey:null, installment:null, billId:bill.id, billMonth:billMonth };
         if(bill.forma === 'cartao' && bill.cardId){
           var cardObj = state.cards.filter(function(c){return c.id===bill.cardId;})[0];
           if(cardObj){ tx.cardId = bill.cardId; tx.invoiceCycleKey = cycleKey(invoiceCycleForDate(cardObj, toLocalDate(ldate))); }
@@ -1853,10 +2195,10 @@
             if(entradaLeg){ Object.assign(entradaLeg, { value:value, date:date, desc:desc, accountId:destinoId }); }
           }else{
             var transferId = uid();
-            state.transactions.push({ id:uid(), value:value, date:date, desc:desc, category:transferCategory, forma:'Transferência', tipo:'saida', accountId:origemId, cardId:null, invoiceCycleKey:null, installment:null, isTransfer:true, transferId:transferId });
-            state.transactions.push({ id:uid(), value:value, date:date, desc:desc, category:transferCategory, forma:'Transferência', tipo:'entrada', accountId:destinoId, cardId:null, invoiceCycleKey:null, installment:null, isTransfer:true, transferId:transferId });
+            state.transactions.push({ criadoPor:meUser(), id:uid(), value:value, date:date, desc:desc, category:transferCategory, forma:'Transferência', tipo:'saida', accountId:origemId, cardId:null, invoiceCycleKey:null, installment:null, isTransfer:true, transferId:transferId });
+            state.transactions.push({ criadoPor:meUser(), id:uid(), value:value, date:date, desc:desc, category:transferCategory, forma:'Transferência', tipo:'entrada', accountId:destinoId, cardId:null, invoiceCycleKey:null, installment:null, isTransfer:true, transferId:transferId });
           }
-          state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft();
+          state.editing={type:null,id:null,transferId:null}; state.modal=null; state.txDraft=freshTxDraft();
         });
         return;
       }
@@ -1898,13 +2240,13 @@
               var amtCents = base + (i<rem?1:0);
               var cyc = addMonthsToCycle(baseCycle, i);
               var txDate = i===0 ? date : (function(){ var dd = cycleOpenDate(cardObj, cyc); return dd.getFullYear()+'-'+pad2(dd.getMonth()+1)+'-'+pad2(dd.getDate()); })();
-              state.transactions.push({ id:uid(), value:amtCents/100, date:txDate, desc:desc, category:category, forma:forma, tipo:tipo, accountId:null, cardId:cardId, invoiceCycleKey:cycleKey(cyc), installment: n>1?{current:i+1,total:n}:null, installmentGroupId: groupId });
+              state.transactions.push({ criadoPor:meUser(), id:uid(), value:amtCents/100, date:txDate, desc:desc, category:category, forma:forma, tipo:tipo, accountId:null, cardId:cardId, invoiceCycleKey:cycleKey(cyc), installment: n>1?{current:i+1,total:n}:null, installmentGroupId: groupId });
             }
           }else{
-            state.transactions.push({ id:uid(), value:value, date:date, desc:desc, category:category, forma:forma, tipo:tipo, accountId:accountId, cardId:null, invoiceCycleKey:null, installment:null });
+            state.transactions.push({ criadoPor:meUser(), id:uid(), value:value, date:date, desc:desc, category:category, forma:forma, tipo:tipo, accountId:accountId, cardId:null, invoiceCycleKey:null, installment:null });
           }
         }
-        state.editing={type:null,id:null,transferId:null}; state.txDraft=freshTxDraft();
+        state.editing={type:null,id:null,transferId:null}; state.modal=null; state.txDraft=freshTxDraft();
       });
     }
   });
